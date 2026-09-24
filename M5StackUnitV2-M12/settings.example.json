@@ -1,0 +1,29 @@
+{
+  "ws_url": "ws://192.168.1.8:9002/camera",
+  "audio_device": null,
+  "audio_channels": 1,
+  "audio_sudo": null,
+  "sample_rate": 16000,
+  "chunk_seconds": 0.5,
+  "record_seconds": 0,
+  "reconnect_delay": 3.0,
+  "record_restart_delay": 3.0,
+  "logging": {
+    "enabled": true,
+    "level": "INFO",
+    "dir": "/sdcard/logs",
+    "max_bytes": 2097152,
+    "backup_count": 1
+  },
+  "vad": {
+    "enabled": true,
+    "alpha": 0.05,
+    "min_threshold": 20,
+    "multiplier": 1.1,
+    "active_multiplier": 1.05,
+    "active_min_threshold": 25,
+    "calibration_seconds": 3.0,
+    "silence_seconds": 2.0,
+    "pre_record_seconds": 0.4
+  }
+}

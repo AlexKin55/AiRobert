@@ -1,0 +1,59 @@
+{
+  "_comment": "Single config of the AiService. The path can be overridden with the AISERVICE_CONFIG variable. The structure mirrors AiServer (config/settings.json); string values support ${VAR} substitution from the environment.",
+
+  "server": {
+    "_comment": "HTTP/WebSocket server settings. One process listens on both WebSockets on a single port: ws://host:port/camera (camera) and ws://host:port/robot (robot).",
+    "host": "0.0.0.0",
+    "port": 9002
+  },
+
+  "camera_ws": {
+    "_comment": "Camera WebSocket (JSON protocol): the camera sends audio (base64 PCM), pictures (base64 JPEG), face/emotion events; the server replies mute/unmute/capture.",
+    "path": "/camera"
+  },
+
+  "robot_ws": {
+    "_comment": "Robot WebSocket (JSON protocol): the server sends audio chunks for playback (base64) and movement/emotion commands; the robot replies hb/ack. The robot microphone is disabled: audio comes only from the camera.",
+    "path": "/robot"
+  },
+
+  "audio": {
+    "_comment": "Audio stream format of the protocol. The only codec is codec_pcm=1: raw PCM int16 LE, 16 kHz/mono (matches the AiBot microphone). chunk_seconds — expected duration of one PCM chunk from the camera (1 s = 32 KB).",
+    "sample_rate": 16000,
+    "channels": 1,
+    "bits_per_sample": 16,
+    "frame_type": 1,
+    "codec_pcm": 1,
+    "chunk_seconds": 1.0
+  },
+
+  "image": {
+    "_comment": "Picture format of the protocol. The camera sends discrete pictures (not a video stream): codec_jpeg=1 — JPEG (binary frames [2][1][jpeg]). max_frame_bytes — safety limit for a picture size (larger pictures are dropped with a log).",
+    "codec_jpeg": 1,
+    "codec_png": 2,
+    "max_frame_bytes": 3000000,
+    "save_frames": false
+  },
+
+  "recording": {
+    "_comment": "Debug media recording (a directory relative to the service root or an absolute path; can be overridden with env RECORD_DIR). Files: *_in.wav (audio from the camera), *_out.wav (audio to the robot), *_img.jpg (pictures); names start with the reception time (us). audio_rotate_seconds — incoming audio rotation (0 = one file per session).",
+    "record_dir": "records",
+    "save_audio": true,
+    "save_images": true,
+    "audio_rotate_seconds": 0
+  },
+
+  "robot": {
+    "_comment": "Robot voice playback settings (JSON protocol). play_chunk_seconds — duration of one PCM chunk (0.15 s = 4800 B -> ~6.4 KB as a base64 JSON message, so it stays below the robot WS client's ~8 KB receive limit). play_speed — delivery pace of the voice (1.0 = real time).",
+    "play_chunk_seconds": 0.15,
+    "play_speed": 1.0
+  },
+
+  "yandex": {
+    "_comment": "Yandex Cloud SpeechKit STT: streaming recognition of the camera speech (PCM 16 kHz/mono). Credentials from the environment (${VAR}): YANDEX_API_KEY (Api-Key) + YANDEX_FOLDER_ID. stt_enabled — enable/disable recognition; the utterance result is saved next to the recording (<stamp>_in.txt).",
+    "api_key": "${API-KEY}",
+    "folder_id": "${FOLDER-ID}",
+    "stt_enabled": true,
+    "stt_language": "ru-RU"
+  }
+}

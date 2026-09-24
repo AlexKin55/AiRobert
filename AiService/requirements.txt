@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+websockets>=12.0
+grpcio>=1.50.0
+yandexcloud>=0.20.0

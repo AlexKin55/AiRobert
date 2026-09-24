@@ -1,0 +1,8 @@
+# Camera dependencies (M5Stack UnitV2, Python >= 3.8).
+# Install: pip install -r requirements.txt
+#
+# Audio capture — system arecord (ALSA), PortAudio is not needed:
+#   sudo apt install alsa-utils
+
+websocket-client           # sync WebSocket client to AiService
+opencv-python              # camera snapshots (Camera class)
