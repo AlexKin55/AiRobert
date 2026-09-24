@@ -2,6 +2,8 @@
 
 #include <M5Unified.h>
 
+#include "config/config.h"
+
 bool EspSound::begin()
 {
     return begin(Config{});
@@ -21,7 +23,8 @@ bool EspSound::begin(const Config& config)
     auto spkCfg = M5.Speaker.config();
     spkCfg.sample_rate = config_.sampleRate;
     M5.Speaker.config(spkCfg);
-    M5.Speaker.setVolume(200);
+    // Volume from config (0..255); overridable with -DSPEAKER_VOLUME=N.
+    M5.Speaker.setVolume(SPEAKER_VOLUME);
 
     enabled_ = M5.Speaker.begin();
     return enabled_;

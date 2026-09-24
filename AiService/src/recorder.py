@@ -67,23 +67,31 @@ class _AudioWriter:
 
 
 class Recorder:
-    """Saves incoming/outgoing audio (.wav) and pictures (.jpg).
+    """Saves incoming/outgoing audio (.wav), pictures (.jpg) and AI debug data.
 
     * _in.wav: streamed camera audio; one file per segment. If
       rotate_seconds > 0, a new file starts every N seconds of audio
       (0 = one file per camera session).
     * _out.wav: playback sent to the robot (one file per send_robot_audio
       call, closed after the EOF marker).
+    * _tts.wav: synthesized answer PCM (one file per GPT+TTS turn).
     * _img.jpg: one file per picture.
+    * _prompt.txt: GPT exchange (system prompt + user text + answer).
     """
 
     def __init__(self, record_dir: str, sample_rate: int = 16000,
                  save_audio: bool = True, save_images: bool = True,
+                 save_tts_audio: bool = True, save_prompts: bool = True,
                  rotate_seconds: float = 0.0) -> None:
         self.record_dir = Path(record_dir)
         self.sample_rate = sample_rate
         self.save_audio = bool(save_audio)
         self.save_images = bool(save_images)
+        # NOTE: the flag is named save_tts (not save_tts_audio) so it does not
+        # shadow the save_tts_audio() method (an instance attribute would
+        # override the class method -> "'bool' object is not callable").
+        self.save_tts = bool(save_tts_audio)
+        self.save_prompts = bool(save_prompts)
         self.rotate_seconds = max(0.0, float(rotate_seconds))
         self._audio_in: Optional[_AudioWriter] = None
         self._audio_out: Optional[_AudioWriter] = None
@@ -94,6 +102,8 @@ class Recorder:
         self.audio_out_files = 0
         self.image_files = 0
         self.stt_files = 0
+        self.tts_audio_files = 0
+        self.prompt_files = 0
 
     # ------------------------------------------------------------------
     # Incoming camera audio (_in.wav).
@@ -184,6 +194,61 @@ class Recorder:
             self.last_in_path = path
             self.audio_in_files += 1
         logger.info("[recorder] wav started: %s", path)
+
+    # ------------------------------------------------------------------
+    # AI debug: synthesized answer audio (_tts.wav) and GPT prompt log.
+    # ------------------------------------------------------------------
+    def save_tts_audio(self, pcm: bytes) -> Optional[Path]:
+        """Saves the synthesized answer PCM as <stamp>_tts.wav (debug).
+
+        Controlled by the recording.save_tts_audio setting.
+        """
+        if not self.save_tts or not pcm:
+            return None
+        try:
+            self.record_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("[recorder] cannot create %s: %s",
+                           self.record_dir, exc)
+            return None
+        path = self.record_dir / f"{stamp_now()}_tts.wav"
+        try:
+            writer = _AudioWriter(path, self.sample_rate)
+            writer.write(pcm)
+            writer.close()
+            self.tts_audio_files += 1
+            return path
+        except OSError as exc:
+            logger.warning("[recorder] failed to save TTS audio: %s", exc)
+            return None
+
+    def save_prompt_log(self, prompt: str, user_text: str,
+                        answer: str) -> Optional[Path]:
+        """Saves the GPT exchange to <stamp>_prompt.txt (debug).
+
+        Controlled by the recording.save_prompts setting.
+        """
+        if not self.save_prompts:
+            return None
+        if not user_text or not answer:
+            return None
+        try:
+            self.record_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("[recorder] cannot create %s: %s",
+                           self.record_dir, exc)
+            return None
+        path = self.record_dir / f"{stamp_now()}_prompt.txt"
+        body = f"[System prompt]\n{prompt}\n\n[User]\n{user_text}\n\n" \
+               f"[Answer]\n{answer}\n"
+        try:
+            path.write_text(body, encoding="utf-8")
+            self.prompt_files += 1
+            logger.info("[recorder] prompt log saved: %s", path)
+            return path
+        except OSError as exc:
+            logger.warning("[recorder] failed to save prompt log: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Pictures (_img.jpg).

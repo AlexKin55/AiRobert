@@ -36,23 +36,25 @@
 #define WIFI_RECONNECT_DELAY_MS 5000u
 #endif
 
-// WebSocket server the robot connects to.
+// WebSocket server the robot connects to: the AiService /robot endpoint
+// (JSON protocol, see AiService/src/protocol.py). WS_PORT must match the
+// AiService server.port (9002) and WS_PATH — the robot_ws.path ("/robot").
 #ifndef WS_HOST
 #define WS_HOST "192.168.1.8"
 #endif
 
 #ifndef WS_PORT
-#define WS_PORT 9001u
+#define WS_PORT 9002u
 #endif
 
 #ifndef WS_PATH
-#define WS_PATH "/"
+#define WS_PATH "/robot"
 #endif
 
-// Heartbeat (robot -> server), ms. Every 15 s the robot sends a text frame
-// "HB" so the router/Wi-Fi does not drop an idle TCP session (NAT dies after
-// ~2 minutes without traffic). The server only logs HB and NEVER drops the
-// connection when HB stops arriving.
+// Heartbeat (robot -> server), ms. Every 15 s the robot sends a text JSON
+// frame {"type":"hb","timestamp":...} so the router/Wi-Fi does not drop an
+// idle TCP session (NAT dies after ~2 minutes without traffic). The server
+// only logs HB and NEVER drops the connection when HB stops arriving.
 #ifndef WS_HEARTBEAT_INTERVAL_MS
 #define WS_HEARTBEAT_INTERVAL_MS 15000u
 #endif
@@ -133,6 +135,19 @@
 // by itself and returns the microphone to listening (VAD).
 #ifndef PLAYBACK_IDLE_TIMEOUT_MS
 #define PLAYBACK_IDLE_TIMEOUT_MS 6000u
+#endif
+
+// Speaker volume (0..255, M5Unified Speaker.setVolume). Raise it if the
+// robot speaks too quietly; 255 is the maximum.
+#ifndef SPEAKER_VOLUME
+#define SPEAKER_VOLUME 240
+#endif
+
+// PCM playback gain (amplification of the incoming int16 samples, with
+// saturation). Yandex TTS often returns a quiet signal, so 1.0 may sound
+// too low even at max speaker volume. 2.0 = +6 dB. 1.0 disables the gain.
+#ifndef PLAYBACK_GAIN
+#define PLAYBACK_GAIN 2.0f
 #endif
 
 #endif  // CONFIG_H_

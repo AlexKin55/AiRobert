@@ -54,11 +54,17 @@ class RobotSession(WsSession):
         logger.info("[robot] emotion %s -> %s", text, self.peer)
         return await self.send_text(text)
 
-    async def send_audio_chunk(self, pcm: bytes) -> bool:
-        """Playback chunk {"type":"audio","audio":"<b64>"}; "" = EOF marker."""
-        ok = await self.send_text(proto.robot_audio_message(pcm))
+    async def send_audio_frame(self, frame_type: int, codec: int,
+                               payload: bytes) -> bool:
+        """Sends a binary audio frame [type][codec][payload].
+
+        Binary playback keeps the ESP32 free of base64/JSON decoding — the
+        PCM goes straight from the WS frame into the speaker queue (no
+        stutter). Empty payload = end-of-playback marker.
+        """
+        ok = await self.send_bytes(bytes((frame_type, codec)) + payload)
         if ok:
-            self.playback_bytes += len(pcm)
+            self.playback_bytes += len(payload)
         return ok
 
     # ------------------------------------------------------------------

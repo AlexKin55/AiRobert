@@ -8,16 +8,18 @@ data is embedded in JSON via base64):
 |-----------|-----------|---------|
 | `/camera` | camera → server | microphone audio (`audio`, base64 PCM), pictures (`image`, base64 JPEG), `face`/`emotion` events |
 | `/camera` | server → camera | `mute`/`unmute` (microphone), `capture` (request a picture) |
-| `/robot`  | server → robot | playback audio chunks (`audio`, base64 PCM + EOF marker), `movement`, `emotion` |
-| `/robot`  | robot → server | `hb`, `ack` |
+| `/robot`  | server → robot | playback audio as **binary frames** `[type][codec][raw PCM]` (+ empty EOF frame), `movement`/`emotion` as JSON text |
+| `/robot`  | robot → server | `hb`, `ack` (JSON text) |
 
 The robot connects as a WS client directly to the server (over Wi-Fi), as
 before; the camera is not relaying anything. The robot's microphone is
 disabled — audio comes only from the camera.
 
 AI processing is handled by [`processor.py`](src/processor.py): streaming
-Yandex SpeechKit STT for camera audio segments (the rest — object detection,
-dialogue logic — is still a stub). The full "wiring" (protocol, two
+Yandex SpeechKit STT for camera audio segments, then the answer pipeline —
+YandexGPT (with the system prompt from `yandex.system_prompt`) + SpeechKit
+TTS v3 synthesis — played back to the robot in the background. Object
+detection and face-id dialogue remain stubs. The full "wiring" (protocol, two
 WebSockets, state machine, recording, statistics) works for real.
 
 ## Run
@@ -61,9 +63,10 @@ AiService/
     ├── camera.py          — camera session: JSON parsing, mute/unmute/capture
     ├── robot.py           — robot session: JSON audio chunks, movement/emotion
     ├── state_machine.py   — event routing, service states
-    ├── recorder.py        — debug recording of audio (.wav) and pictures (.jpg)
-    ├── processor.py       — AI pipeline: streaming Yandex STT (+ stubs)
-    ├── yandex.py          — SpeechKit STT v3 (streaming recognizer, credentials)
+    ├── emotion_decay.py   — post-dialogue emotion decay (Neutral -> Doubt -> Sleepy)
+    ├── recorder.py        — debug recording of audio (.wav), pictures (.jpg), GPT prompts
+    ├── processor.py       — AI pipeline: streaming STT + GPT answer + TTS
+    ├── yandex.py          — Yandex Cloud: STT v3 streaming, YandexGPT, TTS v3
     └── aiservice.py       — (legacy module)
 ```
 
@@ -76,9 +79,12 @@ tools:
 - `<reception time>_in.wav` — audio from the camera (first chunk = creation time);
 - `<time>_in.txt` — recognized STT text for the utterance (next to the WAV);
 - `<time>_out.wav` — outgoing audio to the robot (playback);
+- `<time>_tts.wav` — synthesized answer PCM (one per GPT+TTS turn);
+- `<time>_prompt.txt` — GPT exchange: system prompt + user text + answer;
 - `<time>_img.jpg` — pictures from the camera.
 
-`recording.save_audio` / `save_images` toggle saving;
+`recording.save_audio` / `save_images` toggle media saving;
+`recording.save_tts_audio` / `save_prompts` toggle the GPT/TTS debug files;
 `recording.audio_rotate_seconds` rotates the incoming WAV (0 = one file per
 camera connection session).
 
@@ -87,20 +93,29 @@ longer than `AUDIO_SEGMENT_GAP` = 3 s), so it can be played while the server
 keeps running; each speech segment produces its own WAV (and TXT when STT
 returns text).
 
-## Yandex STT
+## Yandex: STT + GPT + TTS
 
 The camera sends audio only during speech (its VAD), so each utterance is a
 segment. The service:
 
 1. opens a `StreamingRecognizer` (SpeechKit STT v3 gRPC) when the segment starts;
 2. feeds every PCM chunk into the stream immediately;
-3. on a pause (utterance end) finalizes the stream and logs/saves the text.
+3. on a pause (utterance end) finalizes the stream, logs/saves the text;
+4. starts a **background answer task**: `Processor.ask()` calls YandexGPT with
+   the `yandex.system_prompt` prompt, extracts the optional trailing
+   `Emotion: <name>` command, synthesizes the answer via SpeechKit TTS v3
+   (`yandex.tts_voice` / `tts_speed` / `tts_role`) and sends the PCM to the
+   robot (`sm.send_robot_audio`) plus the emotion command if present.
+
+The GPT/TTS parameters live in the `yandex` section of
+[`config/settings.json`](config/settings.json); the debug saving is controlled
+by `recording.save_tts_audio` / `save_prompts`.
 
 Credentials: `YANDEX_API_KEY` / `YANDEX_FOLDER_ID` env vars or the `yandex`
 section of [`config/settings.json`](config/settings.json). If Yandex is
 unavailable or the credentials are invalid, errors are logged with a clear
 category (no connection / bad key / forbidden) and the server keeps working —
-when Yandex recovers, new segments are recognized as usual.
+when Yandex recovers, new segments are answered as usual.
 
 ---
 
@@ -140,15 +155,18 @@ disabled — audio comes only from the camera.
 
 ## Server → robot
 
-| type       | example                                                 |
-|------------|---------------------------------------------------------|
-| `audio`    | `{"type":"audio","audio":"<base64 PCM chunk>"}` — playback chunks; `"audio":""` — EOF marker |
-| `movement` | `{"type":"movement","axis":"left","degrees":60}` / `{"type":"movement","axis":"center"}` |
-| `emotion`  | `{"type":"emotion","name":"happy"}` (happy/angry/sad/doubt/sleepy/neutral) |
+| message   | format                                                                 |
+|-----------|------------------------------------------------------------------------|
+| `audio`   | **binary** `[type=1][codec=1][raw PCM int16 LE 16 kHz mono]` — playback chunk; `[type][codec]` with empty payload — EOF marker |
+| `movement`| text `{"type":"movement","axis":"left","degrees":60}` / `{"type":"movement","axis":"center"}` |
+| `emotion` | text `{"type":"emotion","name":"happy"}` (happy/angry/sad/doubt/sleepy/neutral) |
 
-Chunk — `robot.play_chunk_seconds` (0.15 s = 4800 B PCM → ~6.4 KB of base64
-text, to stay under the robot WS client receive limit of ~8 KB). Delivery pace
-— `robot.play_speed` (1.0 = real time); the stream ends with the EOF marker.
+Audio is sent as **binary frames** (no base64/JSON) so the ESP32 plays the
+PCM directly from the WS frame buffer without decoding — no stutter. Chunk —
+`robot.play_chunk_seconds` (0.15 s = 4800 B, stays under the robot WS client
+receive limit of ~8 KB). Delivery pace — `robot.play_speed` (1.0 = real time):
+the pause between frames equals the frame duration / speed; the stream ends
+with an empty `[type][codec]` frame (EOF).
 
 ## Robot → server
 
@@ -184,12 +202,22 @@ STREAMING    — the camera is streaming audio chunks
 ```
 
 Camera events (audio/picture/face/emotion) → `Processor` (STT + stubs).
-Robot commands are sent via `sm.send_robot_move/emotion/audio`.
+After the STT text is recognized, a background task answers via GPT + TTS and
+plays the result back to the robot (`sm.send_robot_audio`) with the optional
+emotion command. Robot commands are sent via `sm.send_robot_move/emotion/audio`.
+
+When a dialogue ends, [`emotion_decay.py`](src/emotion_decay.py) schedules the
+post-dialogue emotion decay: after `yandex.emotion_decay_neutral_ms` the robot
+gets Neutral, then Doubt (`doubt_ms`), then Sleepy (`sleepy_ms`); each stage
+asks GPT for a short phrase (the `yandex.emotion_decay_prompt`) and plays it
+back. A new dialogue cancels the countdown.
 
 # Roadmap
 
 1. Real object detection in [`processor.detect_objects()`](src/processor.py)
    (YOLO/ONNX) and face-id handling.
-2. Dialogue logic: GPT answer generation + TTS → `sm.send_robot_audio(pcm)`.
+2. ~~Dialogue logic: GPT answer generation + TTS → `sm.send_robot_audio(pcm)`.~~
+   Done — see [`processor.ask()`](src/processor.py) and
+   [`state_machine._answer_worker()`](src/state_machine.py).
 3. Robot notification when Yandex is unavailable (voice prompt).
 4. A `set` command to change camera resolution/fps on the fly.

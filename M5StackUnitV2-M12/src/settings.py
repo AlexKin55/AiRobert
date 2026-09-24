@@ -71,7 +71,7 @@ DEFAULTS = {
         # catches up with the real background so room noise does not keep the
         # segment open forever (background above threshold -> "stuck").
         'calibration_seconds': 3.0,
-        'silence_seconds': 2.0,
+        'silence_seconds': 1.0,
         'pre_record_seconds': 0.4,
     },
     # settings.json search paths (camera SD card).

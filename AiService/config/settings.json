@@ -18,7 +18,7 @@
   },
 
   "audio": {
-    "_comment": "Audio stream format of the protocol. The only codec is codec_pcm=1: raw PCM int16 LE, 16 kHz/mono (matches the AiBot microphone). chunk_seconds — expected duration of one PCM chunk from the camera (1 s = 32 KB).",
+    "_comment": "Audio stream format of the protocol. The only codec is codec_pcm=1: raw PCM int16 LE, 16 kHz/mono. Playback to the robot is BINARY frames [frame_type][codec_pcm][raw PCM] (no base64/JSON — the ESP32 plays the PCM directly, no stutter); an empty payload is the end-of-stream marker. chunk_seconds — expected duration of one camera audio chunk (1 s = 32 KB).",
     "sample_rate": 16000,
     "channels": 1,
     "bits_per_sample": 16,
@@ -36,24 +36,42 @@
   },
 
   "recording": {
-    "_comment": "Debug media recording (a directory relative to the service root or an absolute path; can be overridden with env RECORD_DIR). Files: *_in.wav (audio from the camera), *_out.wav (audio to the robot), *_img.jpg (pictures); names start with the reception time (us). audio_rotate_seconds — incoming audio rotation (0 = one file per session).",
+    "_comment": "Debug media recording (a directory relative to the service root or an absolute path; can be overridden with env RECORD_DIR). Files: *_in.wav (audio from the camera), *_out.wav (audio to the robot), *_tts.wav (synthesized answer), *_img.jpg (pictures), *_prompt.txt (GPT exchange: system prompt + user text + answer); names start with the reception time (us). audio_rotate_seconds — incoming audio rotation (0 = one file per session). save_tts_audio / save_prompts — disable the GPT/TTS debug saving.",
     "record_dir": "records",
     "save_audio": true,
     "save_images": true,
+    "save_tts_audio": true,
+    "save_prompts": true,
     "audio_rotate_seconds": 0
   },
 
   "robot": {
-    "_comment": "Robot voice playback settings (JSON protocol). play_chunk_seconds — duration of one PCM chunk (0.15 s = 4800 B -> ~6.4 KB as a base64 JSON message, so it stays below the robot WS client's ~8 KB receive limit). play_speed — delivery pace of the voice (1.0 = real time).",
+    "_comment": "Robot voice playback settings. play_chunk_seconds — duration of one binary PCM frame (0.15 s = 4800 B, stays below the robot WS client's ~8 KB receive limit). play_speed — delivery pace: the pause between frames equals the frame duration / play_speed (1.0 = real time, prevents buffer overflow/stutter on the robot). drop_audio_during_playback — drop camera audio while the robot is playing (echo-loop protection: the camera hears the speaker and triggers itself).",
     "play_chunk_seconds": 0.15,
-    "play_speed": 1.0
+    "play_speed": 1.0,
+    "drop_audio_during_playback": true
   },
 
   "yandex": {
-    "_comment": "Yandex Cloud SpeechKit STT: streaming recognition of the camera speech (PCM 16 kHz/mono). Credentials from the environment (${VAR}): YANDEX_API_KEY (Api-Key) + YANDEX_FOLDER_ID. stt_enabled — enable/disable recognition; the utterance result is saved next to the recording (<stamp>_in.txt).",
-    "api_key": "${API-KEY}",
-    "folder_id": "${FOLDER-ID}",
+    "_comment": "Yandex Cloud: STT (streaming recognition of the camera speech), YandexGPT (answer generation) and TTS (speech synthesis). Credentials from the environment (${VAR}) or directly in api_key / folder_id. stt_enabled — enable/disable recognition. system_prompt — the GPT system prompt; gpt_model / gpt_timeout_s / gpt_temperature / gpt_max_tokens — YandexGPT parameters; tts_voice / tts_speed / tts_role — SpeechKit TTS voice parameters. emotion_decay_prompt — prompt for post-dialogue emotion decay (GPT generates a short phrase for the emotion); emotion_decay_neutral_ms / sad_ms / sleepy_ms — decay delays after the dialogue ends (Neutral -> Sad -> Sleepy). Emotion decay sounds: emotion_decay_yawn_file — WAV played right after the Sleepy phrase; emotion_decay_snore_file — WAV played emotion_decay_snore_after_ms later (the robot falls asleep). Both files must already be PCM int16 LE 16 kHz mono (no conversion on the server); paths are relative to the AiService root.",
+    "api_key": "API-KEY",
+    "folder_id": "FOLDER-ID",
     "stt_enabled": true,
-    "stt_language": "ru-RU"
+    "stt_language": "ru-RU",
+    "system_prompt": "Ты — Роберт, веселый, шутливый, харизматичный и эмоциональный собеседник. Твоя цель — поддерживать увлекательный разговор, отвечать на любые вопросы пользователя с юмором используя в том числе и прошлые три диалога. Ты общаешься непринужденно, любишь шутить, но при этом остаешься полезным помощником.Речь пользователя приходит после распознаавания и может иметь неточности и ошибки, тебе нужно будет учесть это и исправить исходя из контекста разговора. Обязательное техническое правило:В самом конце каждого своего сообщения, строго с новой строки, ты обязан указать текущую эмоцию, которая лучше всего отражает контекст и настроение твоего ответа или текущего диалога. Эмоция выбирается только из этого списка: Emotion: Happy, Angry, Sad, Doubt, Sleepy, Neutral",
+    "gpt_model": "yandexgpt/latest",
+    "gpt_timeout_s": 90,
+    "gpt_temperature": 0.5,
+    "gpt_max_tokens": 1000,
+    "tts_voice": "alena",
+    "tts_speed": 1.1,
+    "tts_role": "good",
+    "emotion_decay_prompt": "Ты остался один. Тебе сообщена текущая эмоция (одно из: neutral, sad, sleepy). Сгенерируй уместную и новую в отличие от прошлого раза реплику вслух, которую ты произнесёшь сам себе, находясь в этой эмоции. Реплика должна звучать живо и естественно: для neutral — спокойное замечание, для sad — немного грустная фраза или известная цитата, для sleepy — сонная фраза.",
+    "emotion_decay_neutral_ms": 10000,
+    "emotion_decay_sad_ms": 30000,
+    "emotion_decay_sleepy_ms": 45000,
+    "emotion_decay_yawn_file": "/home/alex/Work/Robert/AiService/sounds/yawn.wav",
+    "emotion_decay_snore_file": "/home/alex/Work/Robert/AiService/sounds/snore.wav",
+    "emotion_decay_snore_after_ms": 5000
   }
 }

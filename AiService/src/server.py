@@ -36,6 +36,8 @@ rec = recorder_mod.Recorder(
     sample_rate=app_config.CONFIG["audio"]["sample_rate"],
     save_audio=_REC_CFG.get("save_audio", True),
     save_images=_REC_CFG.get("save_images", True),
+    save_tts_audio=_REC_CFG.get("save_tts_audio", True),
+    save_prompts=_REC_CFG.get("save_prompts", True),
     rotate_seconds=_REC_CFG.get("audio_rotate_seconds", 0),
 )
 
@@ -46,6 +48,7 @@ _Y_CFG = app_config.CONFIG.get("yandex", {})
 ai = Processor(
     stt_enabled=_Y_CFG.get("stt_enabled", True),
     stt_language=_Y_CFG.get("stt_language", "ru-RU"),
+    rec=rec,
 )
 sm = AiStateMachine(camera, robot, ai, rec=rec)
 

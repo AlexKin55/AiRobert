@@ -22,11 +22,15 @@ Service -> camera:
     {"type":"mute"} / {"type":"unmute"} / {"type":"capture"} (+timestamp)
 
 Service -> robot (/robot):
-    {"type":"audio","audio":"<base64 pcm chunk>","timestamp":...}  # "" = EOF
+  Text (commands):
     {"type":"movement","axis":"left","degrees":60,"timestamp":...}
     {"type":"emotion","name":"happy","timestamp":...}
+  Binary (playback audio): [byte0=type][byte1=codec][raw PCM int16 LE
+  16 kHz mono]; an empty payload [type][codec] = end-of-stream marker.
+  Audio is binary so the ESP32 plays the PCM directly from the frame
+  buffer without base64/JSON decoding (no stutter) — commands stay text.
 
-Robot -> service:
+Robot -> service (text):
     {"type":"hb","timestamp":...}
     {"type":"ack","command":"MOVE:left:60","timestamp":...}
 """
@@ -61,6 +65,12 @@ ROBOT_EMOTIONS = (
 
 # Robot movement axes (validated before sending).
 ROBOT_AXES = ("left", "right", "up", "down", "center")
+
+# Binary audio frame layout (server -> robot): byte[0] = type,
+# byte[1] = codec, then raw PCM payload. The only codec is 1:
+# raw PCM int16 LE, 16 kHz mono. An empty payload = EOF marker.
+ROBOT_AUDIO_FRAME_TYPE = 1
+ROBOT_AUDIO_CODEC_PCM = 1
 
 
 # ---------------------------------------------------------------------------
@@ -182,3 +192,8 @@ def robot_emotion_message(name: str) -> str:
 def robot_ack_message(command: str) -> str:
     """Robot -> service: movement finished (ACK:MOVE...)."""
     return make_message(MSG_ACK, command=command)
+
+
+def robot_audio_frame(pcm: bytes) -> bytes:
+    """Binary playback frame [type][codec][pcm]; empty pcm = EOF marker."""
+    return bytes((ROBOT_AUDIO_FRAME_TYPE, ROBOT_AUDIO_CODEC_PCM)) + pcm

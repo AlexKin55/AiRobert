@@ -1,5 +1,7 @@
 #include "websocket/websocket.h"
 
+#include "log/log.h"
+
 EspWebsocketClient::EspWebsocketClient()
 {
     // All library events are forwarded to handleEvent(), which invokes the
@@ -69,23 +71,44 @@ void EspWebsocketClient::setMessageCallback(MessageCallback cb)
     m_onMessage = std::move(cb);
 }
 
+// Leveled logging for link diagnostics (LOG_LEVEL in config/config.h):
+//   LOG_D — frames/ping/pong (frequent), LOG_I — connection events,
+//   LOG_W — drops and library errors, LOG_E — unrecoverable failures.
 void EspWebsocketClient::handleEvent(WStype_t type, uint8_t* payload, size_t length)
 {
     switch (type)
     {
         case WStype_CONNECTED:
+            LOG_I("[ws] connected\n");
             if (m_onConnected) m_onConnected();
             break;
 
         case WStype_DISCONNECTED:
-            if (m_onDisconnected)
-            {
-                const std::string reason = payload ? reinterpret_cast<const char*>(payload) : "";
-                m_onDisconnected(0, reason);
-            }
+        {
+            const std::string reason =
+                payload ? reinterpret_cast<const char*>(payload) : "";
+            LOG_W("[ws] disconnected: %s\n", reason.c_str());
+            if (m_onDisconnected) m_onDisconnected(0, reason);
+            break;
+        }
+
+        case WStype_ERROR:
+            // Library-level error: payload contains a short reason (e.g.
+            // "error: no data, timeout" or "disconnected").
+            LOG_W("[ws] error: %s\n",
+                  payload ? reinterpret_cast<const char*>(payload) : "");
+            break;
+
+        case WStype_PING:
+            LOG_D("[ws] ping received (%d B)\n", static_cast<int>(length));
+            break;
+
+        case WStype_PONG:
+            LOG_D("[ws] pong received (%d B)\n", static_cast<int>(length));
             break;
 
         case WStype_TEXT:
+            LOG_D("[ws] text frame: %d B\n", static_cast<int>(length));
             if (m_onMessage)
             {
                 size_t n = length;
@@ -96,6 +119,7 @@ void EspWebsocketClient::handleEvent(WStype_t type, uint8_t* payload, size_t len
             break;
 
         case WStype_BIN:
+            LOG_D("[ws] binary frame: %d B\n", static_cast<int>(length));
             if (m_onMessage) m_onMessage(payload, length, true);
             break;
 
