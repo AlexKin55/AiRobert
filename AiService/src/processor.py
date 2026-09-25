@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import config as app_config
 
@@ -31,10 +31,17 @@ class Processor:
 
     def __init__(self, stt_enabled: bool = True,
                  stt_language: str = "ru-RU",
-                 rec: Optional[Any] = None) -> None:
+                 rec: Optional[Any] = None,
+                 on_partial: Optional[Callable[[str], None]] = None) -> None:
         from . import yandex as yandex_mod
         self.stt_language = stt_language
         self.stt_enabled = bool(stt_enabled) and yandex_mod.credentials_ok()
+        # Called (from the asyncio loop) with the first recognized word of a
+        # new utterance — the state machine cancels the emotion decay on it.
+        self.on_partial = on_partial
+        # True after the first non-empty STT partial of the current segment
+        # was reported via on_partial (one report per segment).
+        self._first_word_seen = False
         self._stt: Optional[Any] = None
         self._seg_started_at = 0.0
         self.segments = 0       # finished speech segments
@@ -59,6 +66,7 @@ class Processor:
         """Utterance start: opens a Yandex STT recognition stream."""
         if not self.stt_enabled or self._stt is not None:
             return
+        self._first_word_seen = False
         from . import yandex as yandex_mod
         try:
             stt = yandex_mod.StreamingRecognizer(
@@ -79,6 +87,40 @@ class Processor:
                 self._stt.feed(pcm)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[ai] STT feed error: %s", exc)
+            # The first recognized word (STT partial) notifies the caller
+            # immediately — the state machine cancels the emotion decay right
+            # away, without waiting for the whole segment to finish.
+            if not self._first_word_seen:
+                try:
+                    part = self._stt.drain_partial()
+                except Exception:  # noqa: BLE001
+                    part = ""
+                if part and part.strip():
+                    self._first_word_seen = True
+                    logger.info("[ai] first word heard: %r", part)
+                    if self.on_partial is not None:
+                        try:
+                            self.on_partial(part)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("[ai] on_partial callback error: "
+                                           "%s", exc)
+
+    def reset_segment(self) -> None:
+        """Drops the current STT stream WITHOUT waiting for its result.
+
+        Used by the watchdog when a segment hangs (a stuck gRPC stream would
+        otherwise keep the robot silent forever): the stream is aborted and
+        the reference is dropped, so the next audio chunk opens a fresh
+        recognition stream. Never blocks the asyncio loop.
+        """
+        if self._stt is not None:
+            try:
+                self._stt.abort()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[ai] STT abort error: %s", exc)
+            self._stt = None
+        self._first_word_seen = False
+        logger.warning("[ai] STT segment reset (stream dropped)")
 
     async def end_segment(self) -> str:
         """Utterance finalization: closes the stream and returns the text.

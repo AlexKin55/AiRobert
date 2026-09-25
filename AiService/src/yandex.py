@@ -182,6 +182,11 @@ class StreamingRecognizer:
         self._texts: list[str] = []
         # Last partial: fallback if final never arrives.
         self._last_partial = ""
+        # Partial generation counter: each new non-empty partial increments
+        # it, drain_partial() reports only the ones not yet consumed (the
+        # first recognized word of an utterance).
+        self._partial_epoch = 0
+        self._drained_epoch = 0
         self._err: Exception | None = None
         self._done = threading.Event()
         self._started = False
@@ -226,6 +231,33 @@ class StreamingRecognizer:
                         self._last_partial)
             return self._last_partial
         return result
+
+    def drain_partial(self) -> str:
+        """Returns the latest unrecognized partial (the first words heard).
+
+        The STT thread appends partials continuously; this method returns the
+        newest one exactly once — until the next partial arrives it returns
+        "". Safe to call from the asyncio loop (the fields are only written by
+        the STT thread, read here).
+        """
+        if self._partial_epoch > self._drained_epoch:
+            self._drained_epoch = self._partial_epoch
+            return self._last_partial
+        return ""
+
+    def abort(self) -> None:
+        """Closes the recognition stream without waiting for the result.
+
+        Used when a segment hangs (stuck gRPC stream): the audio-queue
+        sentinel makes the generator finish and the daemon thread exits on
+        its own; nobody waits for final alternatives, so the asyncio loop is
+        never blocked. Safe to call more than once.
+        """
+        try:
+            if self._started and not self._done.is_set():
+                self._q.put_nowait(None)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _gen(self):
         from yandex.cloud.ai.stt.v3 import stt_pb2
@@ -300,6 +332,7 @@ class StreamingRecognizer:
                     if (resp.partial.alternatives
                             and resp.partial.alternatives[0].text):
                         self._last_partial = resp.partial.alternatives[0].text
+                        self._partial_epoch += 1
                         logger.info("STT partial: %s", self._last_partial)
                     continue
                 if ev == "final":

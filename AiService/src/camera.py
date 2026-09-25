@@ -15,6 +15,7 @@ send_capture).
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import config as app_config
@@ -55,6 +56,9 @@ class CameraSession(WsSession):
         self.device = ""
         self.last_face: Optional[Dict[str, Any]] = None
         self.last_emotion: str = ""
+        # Monotonic time of the last message received from the camera
+        # (any type: audio/HB/image); the watchdog detects a hung camera.
+        self.last_activity = 0.0
         self.frames_total = 0
         self.audio_frames = 0
         self.image_frames = 0
@@ -74,6 +78,7 @@ class CameraSession(WsSession):
         msg = proto.parse_message(text)
         if msg is None:
             return None
+        self.last_activity = time.monotonic()
         mtype = msg.get("type")
         if mtype == proto.MSG_HELLO:
             self._on_hello(msg)

@@ -14,8 +14,10 @@ Run:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket
@@ -52,9 +54,24 @@ ai = Processor(
 )
 sm = AiStateMachine(camera, robot, ai, rec=rec)
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Startup/shutdown: the background watchdog (silent-camera diagnostics
+    and stuck-STT-segment recovery) runs while the server is up."""
+    task = asyncio.create_task(sm.run_watchdog())
+    logger.info("[ai] watchdog started")
+    try:
+        yield
+    finally:
+        task.cancel()
+        logger.info("[ai] watchdog stopped")
+
+
 app = FastAPI(
     title="AiService: camera <-> robot gateway (JSON protocol)",
     version="0.3.0",
+    lifespan=lifespan,
 )
 
 

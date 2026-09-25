@@ -40,6 +40,16 @@ AUDIO_SEGMENT_GAP = 3.0
 # dropped: the robot drains its playback queue/DMA tail after the EOF marker.
 PLAYBACK_DROP_TAIL_S = 2.0
 
+# Watchdog: after this silence (no audio and no HB at all) from the camera a
+# warning is logged — the camera may have died/disconnected while the WS still
+# looks alive to the peer.
+CAMERA_SILENCE_WARN_S = 30.0
+
+# Watchdog: an STT segment open for longer than this is force-closed (the
+# gRPC stream may hang after an idle period; without the close the next
+# utterance would reuse the dead stream and the robot would stay silent).
+SEGMENT_MAX_AGE_S = 120.0
+
 
 class State(enum.Enum):
     DISCONNECTED = "disconnected"
@@ -68,10 +78,14 @@ class AiStateMachine:
         # Background GPT+TTS answer task for the last recognized utterance.
         self._answer_task: Optional[asyncio.Task] = None
         self._answer_lock = asyncio.Lock()
-        # Post-dialogue emotion decay (Neutral -> Doubt -> Sleepy), see
+        # Post-dialogue emotion decay (Neutral -> Sad -> Sleepy), see
         # emotion_decay.py: GPT phrase + TTS for each stage.
         self._decay = EmotionDecay(self.ai, self.robot,
                                    send_audio=self.send_robot_audio)
+        # Any recognized speech restarts the decay countdown (the emotion
+        # change is postponed): the first STT word restarts it via
+        # _on_first_word, the final segment text — in _schedule_answer.
+        self.ai.on_partial = self._on_first_word
         # True while the camera streams audio chunks (no segment markers in
         # the JSON protocol — the stream is continuous).
         self._streaming = False
@@ -79,6 +93,8 @@ class AiStateMachine:
         self._last_audio = 0.0
         # True while a speech segment is active (STT stream is open).
         self._seg_active = False
+        # Monotonic time when the current STT segment was opened (watchdog).
+        self._seg_started_at = 0.0
         # Playback pacing (chunk size / delivery speed) from the config.
         try:
             self._play_secs = float(
@@ -100,6 +116,17 @@ class AiStateMachine:
     # ------------------------------------------------------------------
     async def on_camera_connected(self) -> None:
         logger.info("Camera connected: %s", self.camera.peer)
+        # Fresh camera session: clear any state left from a previous
+        # connection (stuck STT segment, stale timers) so the new session
+        # starts clean and /health shows the fresh values.
+        self._streaming = False
+        self._last_audio = 0.0
+        self._seg_started_at = 0.0
+        if self._seg_active:
+            self._seg_active = False
+            self.ai.reset_segment()
+        if self.rec is not None:
+            self.rec.close_audio()
         self._update_state()
 
     async def on_camera_disconnected(self) -> None:
@@ -120,8 +147,9 @@ class AiStateMachine:
         logger.info("Robot connected: %s", self.robot.peer)
         self._update_state()
         # Start the emotion decay countdown right away: the robot may keep an
-        # emotion from a previous session, so Neutral -> Doubt -> Sleepy
-        # should run even without a new dialogue. A dialogue cancels it.
+        # emotion from a previous session (e.g. Sad after a mid-decay
+        # disconnect), so Neutral -> Sad -> Sleepy restarts from Neutral and
+        # the face cannot stay stuck. A dialogue restarts/cancels it.
         self._decay.start()
 
     async def on_robot_disconnected(self) -> None:
@@ -135,6 +163,44 @@ class AiStateMachine:
             self.state = State.STREAMING
         else:
             self.state = State.IDLE
+
+    # ------------------------------------------------------------------
+    # Watchdog (started by the server lifespan): silent-camera diagnostics
+    # and stuck-STT-segment recovery.
+    # ------------------------------------------------------------------
+    async def run_watchdog(self) -> None:
+        """Periodic diagnostics loop (every 10 s).
+
+        * If the camera is connected but sends NOTHING (no audio, no HB) for
+          a long time — a warning is logged (the camera may be dead/hung
+          while its WS peer still looks alive).
+        * If an STT segment stays open for too long — it is force-closed so
+          the next utterance starts a fresh recognition stream (a hung gRPC
+          stream would otherwise keep the robot silent forever).
+        """
+        while True:
+            await asyncio.sleep(10.0)
+            now = time.monotonic()
+            try:
+                if self.camera.connected:
+                    age = (now - self.camera.last_activity
+                           if self.camera.last_activity else -1.0)
+                    if age < 0 or age > CAMERA_SILENCE_WARN_S:
+                        logger.warning(
+                            "[camera] silent for %.0f s (no messages; "
+                            "peer=%s)", max(age, 0.0), self.camera.peer)
+                elif self.robot.connected:
+                    logger.warning("[camera] not connected (robot is online)")
+                if (self._seg_active and self._seg_started_at
+                        and now - self._seg_started_at > SEGMENT_MAX_AGE_S):
+                    logger.warning(
+                        "[ai] STT segment stuck for %.0f s — resetting it",
+                        now - self._seg_started_at)
+                    self._seg_active = False
+                    self._seg_started_at = 0.0
+                    self.ai.reset_segment()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[ai] watchdog error: %s", exc)
 
     # ------------------------------------------------------------------
     # JSON message from the camera.
@@ -157,14 +223,16 @@ class AiStateMachine:
                     continue
                 # The first chunk after a pause = start of a new utterance:
                 # open the Yandex STT recognition stream. The emotion decay
-                # is NOT cancelled here — the camera often produces false
-                # segments from background noise ("empty text"), which would
-                # silently kill the decay countdown. It is cancelled only
-                # when a real recognized phrase is scheduled (_schedule_answer).
+                # is NOT restarted here (the camera often produces false
+                # segments from background noise, "empty text") — it is
+                # postponed by non-empty STT results: on the first recognized
+                # word (on_partial -> _on_first_word) and once more when the
+                # final segment text arrives (_schedule_answer).
                 if not self._seg_active or \
                         now - self._last_audio >= AUDIO_SEGMENT_GAP:
                     await self.ai.begin_segment()
                     self._seg_active = True
+                    self._seg_started_at = time.monotonic()
                 self._last_audio = now
                 self._streaming = True
                 self._update_state()
@@ -216,13 +284,27 @@ class AiStateMachine:
         answer is generated; the lock serializes overlapping answers (a new
         utterance while the previous one is still being processed is skipped).
         """
-        # A real dialogue has begun — cancel the post-dialogue emotion decay
-        # so its phrase does not overlap with the actual answer.
-        self._decay.cancel()
+        # Recognized speech — restart the decay countdown: the emotion change
+        # is postponed by the whole delay again (already restarted by the
+        # first word; this is the safety net for segments without partials).
+        # An empty-text segment never reaches this point, so false camera
+        # triggers cannot kill the decay.
+        self._decay.start()
         if self._answer_task is not None and not self._answer_task.done():
             logger.warning("[ai] answer task still busy — skipping utterance")
             return
         self._answer_task = asyncio.create_task(self._answer_worker(text))
+
+    def _on_first_word(self, part: str) -> None:
+        """First STT-recognized word of a new utterance — postpone the decay.
+
+        Called by Processor.process_audio() from the asyncio loop as soon as
+        SpeechKit reports a non-empty partial, so the decay countdown is
+        restarted immediately when the user starts speaking (not after the
+        whole segment ends). start() internally cancels the previous run.
+        """
+        logger.info("[ai] first word heard (%r) — restarting decay", part)
+        self._decay.start()
 
     async def _answer_worker(self, text: str) -> None:
         """Background worker: recognizes -> GPT answer -> TTS -> playback."""
@@ -325,10 +407,18 @@ class AiStateMachine:
     # /health summary.
     # ------------------------------------------------------------------
     def health(self) -> Dict[str, Any]:
+        now = time.monotonic()
         return {
             "state": self.state.value,
             "camera_connected": self.camera.connected,
             "robot_connected": self.robot.connected,
+            "camera_activity_age_s": round(
+                now - self.camera.last_activity, 1)
+            if self.camera.last_activity else None,
+            "last_audio_age_s": round(now - self._last_audio, 1)
+            if self._last_audio else None,
+            "seg_active": self._seg_active,
+            "decay_running": self._decay.running,
             "camera": {
                 "device": self.camera.device,
                 "frames": self.camera.frames_total,

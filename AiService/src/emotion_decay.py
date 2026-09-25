@@ -1,4 +1,4 @@
-"""Post-dialogue emotion decay: Neutral -> Doubt -> Sleepy.
+"""Post-dialogue emotion decay: Neutral -> Sad -> Sleepy.
 
 After a dialogue ends (the answer playback finished) the robot is left alone:
 the server schedules an emotion countdown and at each stage:
@@ -7,12 +7,17 @@ the server schedules an emotion countdown and at each stage:
 2. asks YandexGPT for a short phrase matching that emotion (the
    ``yandex.emotion_decay_prompt`` from settings);
 3. synthesizes the phrase via SpeechKit TTS and plays it back to the robot
-   (binary PCM frames, the same pacing as the main answers).
+   (binary PCM frames, the same pacing as the main answers);
+4. right after the Sleepy phrase — plays the yawn WAV; a short while later
+   (``yandex.emotion_decay_snore_after_ms``) — the snore WAV.
 
 The delays are measured from the end of the dialogue and come from the config
-(``yandex.emotion_decay_neutral_ms`` / ``doubt_ms`` / ``sleepy_ms``). A new
-dialogue cancels the countdown (``cancel()``). All Yandex calls are wrapped
-in try/except — the server never crashes because of the decay.
+(``yandex.emotion_decay_neutral_ms`` / ``sad_ms`` / ``sleepy_ms``). Any
+recognized speech restarts the countdown (``start()``); a new dialogue
+cancels it (``cancel()``). If the robot goes offline mid-decay the countdown
+waits for the reconnect instead of aborting — the face never stays stuck in
+an intermediate emotion. All Yandex calls are wrapped in try/except — the
+server never crashes because of the decay.
 """
 from __future__ import annotations
 
@@ -119,6 +124,23 @@ class EmotionDecay:
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    async def _wait_robot(self, what: str) -> None:
+        """Waits until the robot is back online (no abort, no timeout).
+
+        A temporary robot disconnect (Wi-Fi blip / reboot) must NOT stop the
+        decay: otherwise the face stays stuck in the last emotion (e.g. Sad).
+        The loop polls until the robot reconnects; a new ``start()`` /
+        ``cancel()`` from a dialogue still interrupts the whole countdown.
+        """
+        if self.robot.connected:
+            return
+        logger.info("[ai] emotion decay: %s — robot offline, waiting for "
+                    "reconnect", what)
+        while not self.robot.connected:
+            await asyncio.sleep(2.0)
+        logger.info("[ai] emotion decay: robot reconnected — continuing %s",
+                    what)
+
     async def _run(self, delays: List[Tuple[str, int]],
                    yawn_file: str = _DEFAULT_YAWN_FILE,
                    snore_after_ms: int = 5000,
@@ -130,9 +152,9 @@ class EmotionDecay:
                 logger.info("[ai] emotion decay: %s in %.1f s", emotion,
                             wait)
                 await asyncio.sleep(wait)
-                if not self.robot.connected:
-                    logger.info("[ai] emotion decay: robot offline, abort")
-                    return
+                # The stage runs only when the robot is online; an offline
+                # robot just delays the stage (waits for the reconnect).
+                await self._wait_robot(f"stage {emotion}")
                 # Emotion command first (the face changes immediately), then
                 # the GPT-generated phrase matching the emotion.
                 emo_ok = await self.robot.send_emotion(emotion)
@@ -164,9 +186,7 @@ class EmotionDecay:
             wait = max(0.0, snore_at_ms / 1000.0 - (time.monotonic() - t0))
             logger.info("[ai] emotion decay: snore in %.1f s", wait)
             await asyncio.sleep(wait)
-            if not self.robot.connected:
-                logger.info("[ai] emotion decay: robot offline, snore skipped")
-                return
+            await self._wait_robot("snore")
             snore = _load_pcm(snore_file)
             if snore:
                 ok = await self.send_audio(snore)

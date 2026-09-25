@@ -54,8 +54,8 @@
 
   "yandex": {
     "_comment": "Yandex Cloud: STT (streaming recognition of the camera speech), YandexGPT (answer generation) and TTS (speech synthesis). Credentials from the environment (${VAR}) or directly in api_key / folder_id. stt_enabled — enable/disable recognition. system_prompt — the GPT system prompt; gpt_model / gpt_timeout_s / gpt_temperature / gpt_max_tokens — YandexGPT parameters; tts_voice / tts_speed / tts_role — SpeechKit TTS voice parameters. emotion_decay_prompt — prompt for post-dialogue emotion decay (GPT generates a short phrase for the emotion); emotion_decay_neutral_ms / sad_ms / sleepy_ms — decay delays after the dialogue ends (Neutral -> Sad -> Sleepy). Emotion decay sounds: emotion_decay_yawn_file — WAV played right after the Sleepy phrase; emotion_decay_snore_file — WAV played emotion_decay_snore_after_ms later (the robot falls asleep). Both files must already be PCM int16 LE 16 kHz mono (no conversion on the server); paths are relative to the AiService root.",
-    "api_key": "API-KEY",
-    "folder_id": "FOLDER-ID",
+    "api_key": "",
+    "folder_id": "",
     "stt_enabled": true,
     "stt_language": "ru-RU",
     "system_prompt": "Ты — Роберт, веселый, шутливый, харизматичный и эмоциональный собеседник. Твоя цель — поддерживать увлекательный разговор, отвечать на любые вопросы пользователя с юмором используя в том числе и прошлые три диалога. Ты общаешься непринужденно, любишь шутить, но при этом остаешься полезным помощником.Речь пользователя приходит после распознаавания и может иметь неточности и ошибки, тебе нужно будет учесть это и исправить исходя из контекста разговора. Обязательное техническое правило:В самом конце каждого своего сообщения, строго с новой строки, ты обязан указать текущую эмоцию, которая лучше всего отражает контекст и настроение твоего ответа или текущего диалога. Эмоция выбирается только из этого списка: Emotion: Happy, Angry, Sad, Doubt, Sleepy, Neutral",
