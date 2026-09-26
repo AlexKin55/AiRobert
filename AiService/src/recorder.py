@@ -74,9 +74,10 @@ class Recorder:
       (0 = one file per camera session).
     * _out.wav: playback sent to the robot (one file per send_robot_audio
       call, closed after the EOF marker).
-    * _tts.wav: synthesized answer PCM (one file per GPT+TTS turn).
+    * _tts.wav: answer PCM from the Yandex Realtime session (one file per
+      answer).
     * _img.jpg: one file per picture.
-    * _prompt.txt: GPT exchange (system prompt + user text + answer).
+    * _prompt.txt: model exchange (system prompt + question + answer text).
     """
 
     def __init__(self, record_dir: str, sample_rate: int = 16000,
@@ -101,7 +102,7 @@ class Recorder:
         self.audio_in_files = 0
         self.audio_out_files = 0
         self.image_files = 0
-        self.stt_files = 0
+        self.transcript_files = 0
         self.tts_audio_files = 0
         self.prompt_files = 0
 
@@ -134,8 +135,9 @@ class Recorder:
             return True
         return False
 
-    def save_stt_text(self, text: str) -> Optional[Path]:
-        """Saves the STT result next to the last _in.wav: <stamp>_in.txt.
+    def save_transcript(self, text: str) -> Optional[Path]:
+        """Saves the recognized question transcript next to the last _in.wav:
+        <stamp>_in.txt.
 
         Returns the file path or None (empty text / no audio file).
         """
@@ -144,11 +146,11 @@ class Recorder:
         txt_path = self.last_in_path.with_suffix(".txt")
         try:
             txt_path.write_text(text.strip() + "\n", encoding="utf-8")
-            self.stt_files += 1
-            logger.info("[recorder] STT saved: %s", txt_path)
+            self.transcript_files += 1
+            logger.info("[recorder] transcript saved: %s", txt_path)
             return txt_path
         except OSError as exc:
-            logger.warning("[recorder] failed to save STT: %s", exc)
+            logger.warning("[recorder] failed to save transcript: %s", exc)
             return None
 
     # ------------------------------------------------------------------
@@ -196,10 +198,10 @@ class Recorder:
         logger.info("[recorder] wav started: %s", path)
 
     # ------------------------------------------------------------------
-    # AI debug: synthesized answer audio (_tts.wav) and GPT prompt log.
+    # AI debug: answer audio (_tts.wav) and model prompt log.
     # ------------------------------------------------------------------
     def save_tts_audio(self, pcm: bytes) -> Optional[Path]:
-        """Saves the synthesized answer PCM as <stamp>_tts.wav (debug).
+        """Saves the Realtime answer PCM as <stamp>_tts.wav (debug).
 
         Controlled by the recording.save_tts_audio setting.
         """
@@ -224,7 +226,7 @@ class Recorder:
 
     def save_prompt_log(self, prompt: str, user_text: str,
                         answer: str) -> Optional[Path]:
-        """Saves the GPT exchange to <stamp>_prompt.txt (debug).
+        """Saves the model exchange to <stamp>_prompt.txt (debug).
 
         Controlled by the recording.save_prompts setting.
         """

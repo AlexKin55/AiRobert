@@ -46,31 +46,29 @@ rec = recorder_mod.Recorder(
 # Global sessions and the state machine.
 camera = CameraSession()
 robot = RobotSession()
-_Y_CFG = app_config.CONFIG.get("yandex", {})
-ai = Processor(
-    stt_enabled=_Y_CFG.get("stt_enabled", True),
-    stt_language=_Y_CFG.get("stt_language", "ru-RU"),
-    rec=rec,
-)
+ai = Processor(rec=rec)
 sm = AiStateMachine(camera, robot, ai, rec=rec)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Startup/shutdown: the background watchdog (silent-camera diagnostics
-    and stuck-STT-segment recovery) runs while the server is up."""
+    """Startup/shutdown: opens the persistent Yandex Realtime session (audio
+    question -> audio answer) and runs the background watchdog (silent-camera
+    diagnostics + Realtime-session recovery) while the server is up."""
+    await ai.start()
     task = asyncio.create_task(sm.run_watchdog())
     logger.info("[ai] watchdog started")
     try:
         yield
     finally:
         task.cancel()
+        await ai.stop()
         logger.info("[ai] watchdog stopped")
 
 
 app = FastAPI(
-    title="AiService: camera <-> robot gateway (JSON protocol)",
-    version="0.3.0",
+    title="AiService: camera <-> robot gateway (JSON protocol, Realtime)",
+    version="0.4.0",
     lifespan=lifespan,
 )
 

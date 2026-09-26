@@ -15,12 +15,14 @@ The robot connects as a WS client directly to the server (over Wi-Fi), as
 before; the camera is not relaying anything. The robot's microphone is
 disabled — audio comes only from the camera.
 
-AI processing is handled by [`processor.py`](src/processor.py): streaming
-Yandex SpeechKit STT for camera audio segments, then the answer pipeline —
-YandexGPT (with the system prompt from `yandex.system_prompt`) + SpeechKit
-TTS v3 synthesis — played back to the robot in the background. Object
-detection and face-id dialogue remain stubs. The full "wiring" (protocol, two
-WebSockets, state machine, recording, statistics) works for real.
+AI processing is handled by [`processor.py`](src/processor.py): a SINGLE
+voice channel of the Yandex AI Studio **Realtime API** — the camera audio
+question goes straight into a persistent WebSocket session, the Speech
+Realtime model recognizes it, generates the answer and synthesizes the speech
+in one pass (no STT → GPT → TTS chain); the finished audio answer is played
+back to the robot in the background. Object detection and face-id dialogue
+remain stubs. The full "wiring" (protocol, two WebSockets, state machine,
+recording, statistics) works for real.
 
 ## Run
 
@@ -64,9 +66,10 @@ AiService/
     ├── robot.py           — robot session: JSON audio chunks, movement/emotion
     ├── state_machine.py   — event routing, service states
     ├── emotion_decay.py   — post-dialogue emotion decay (Neutral -> Doubt -> Sleepy)
-    ├── recorder.py        — debug recording of audio (.wav), pictures (.jpg), GPT prompts
-    ├── processor.py       — AI pipeline: streaming STT + GPT answer + TTS
-    ├── yandex.py          — Yandex Cloud: STT v3 streaming, YandexGPT, TTS v3
+    ├── recorder.py        — debug recording of audio (.wav), pictures (.jpg), model prompts
+    ├── processor.py       — AI pipeline: Yandex Realtime (audio question -> audio answer)
+    ├── yandex.py          — Yandex AI Studio Realtime API (WebSocket voice channel)
+    ├── callbacks.py       — Realtime function-calling tools & handlers (emotion, weather)
     └── aiservice.py       — (legacy module)
 ```
 
@@ -77,45 +80,67 @@ For debugging the server saves media to `recording.record_dir` (default
 tools:
 
 - `<reception time>_in.wav` — audio from the camera (first chunk = creation time);
-- `<time>_in.txt` — recognized STT text for the utterance (next to the WAV);
+- `<time>_in.txt` — recognized question transcript from the Realtime session (next to the WAV);
 - `<time>_out.wav` — outgoing audio to the robot (playback);
-- `<time>_tts.wav` — synthesized answer PCM (one per GPT+TTS turn);
-- `<time>_prompt.txt` — GPT exchange: system prompt + user text + answer;
+- `<time>_tts.wav` — answer PCM from the Realtime session (one per answer);
+- `<time>_prompt.txt` — model exchange: system prompt + question transcript + answer text;
 - `<time>_img.jpg` — pictures from the camera.
 
 `recording.save_audio` / `save_images` toggle media saving;
-`recording.save_tts_audio` / `save_prompts` toggle the GPT/TTS debug files;
-`recording.audio_rotate_seconds` rotates the incoming WAV (0 = one file per
-camera connection session).
+`recording.save_tts_audio` / `save_prompts` toggle the answer/prompt debug
+files; `recording.audio_rotate_seconds` rotates the incoming WAV (0 = one
+file per camera connection session).
 
 The `_in.wav` file is finalized when the utterance ends (a pause in audio
 longer than `AUDIO_SEGMENT_GAP` = 3 s), so it can be played while the server
-keeps running; each speech segment produces its own WAV (and TXT when STT
-returns text).
+keeps running; each speech segment produces its own WAV (and TXT when the
+Realtime session returns the question transcript).
 
-## Yandex: STT + GPT + TTS
+## Yandex Realtime: аудио-вопрос → аудио-ответ
 
-The camera sends audio only during speech (its VAD), so each utterance is a
-segment. The service:
+The camera sends audio only during speech (its VAD); every chunk goes into a
+**single persistent Realtime session** — no STT → GPT → TTS chain:
 
-1. opens a `StreamingRecognizer` (SpeechKit STT v3 gRPC) when the segment starts;
-2. feeds every PCM chunk into the stream immediately;
-3. on a pause (utterance end) finalizes the stream, logs/saves the text;
-4. starts a **background answer task**: `Processor.ask()` calls YandexGPT with
-   the `yandex.system_prompt` prompt, extracts the optional trailing
-   `Emotion: <name>` command, synthesizes the answer via SpeechKit TTS v3
-   (`yandex.tts_voice` / `tts_speed` / `tts_role`) and sends the PCM to the
-   robot (`sm.send_robot_audio`) plus the emotion command if present.
+1. `Processor.start()` opens one WebSocket session of the Yandex AI Studio
+   Realtime API
+   (`wss://ai.api.cloud.yandex.net/v1/realtime/openai?model=gpt://<folder>/<model>`)
+   and configures it: system prompt (`yandex.system_prompt`), output voice
+   (`yandex.voice` / `role`), PCM formats (`yandex.realtime_input_rate` /
+   `realtime_output_rate`, default 16000 Hz — no resampling) and the
+   server-side VAD;
+2. camera PCM goes into the session immediately
+   (`input_audio_buffer.append`);
+3. the server-side VAD detects the end of the utterance and the Speech
+   Realtime model recognizes the speech, generates the answer and synthesizes
+   it **in one pass**;
+4. the finished answer arrives as `response.output_audio.delta` chunks (PCM
+   16 kHz mono); the model reports the robot emotion as a FUNCTION CALL
+   (`emotion(name)`, function calling / tools) instead of speaking it, so the
+   answer audio never contains "Emotion: ..." — the tool schema and the
+   server-side handler live in [`callbacks.py`](src/callbacks.py)
+   (`TOOLS` / `dispatch`), the call sends the robot the EMOTION:<name>
+   command, then the PCM is played back (`sm.send_robot_audio`). A trailing
+   text `Emotion: <name>` line remains only as a fallback for models that
+   ignore the tool (`split_emotion()`);
+5. the question transcript (`conversation.item.input_audio_transcription
+   .completed`) is saved next to the `_in.wav` (as `_in.txt`);
+6. a lost connection is restored by the watchdog automatically
+   (`Processor.ensure_running()`).
 
-The GPT/TTS parameters live in the `yandex` section of
-[`config/settings.json`](config/settings.json); the debug saving is controlled
-by `recording.save_tts_audio` / `save_prompts`.
+The Realtime parameters live in the `yandex` section of
+[`config/settings.json`](config/settings.json): `realtime_model` (default
+`speech-realtime-260528`), `voice`, `role`, rates, language, timeout. The
+debug saving is controlled by `recording.save_tts_audio` / `save_prompts`.
+
+The post-dialogue emotion decay also uses the same Realtime model but with a
+one-shot TEXT → audio request (`Processor.say_emotion()` → `ask_audio()`): the
+model both generates the phrase and speaks it in a single call.
 
 Credentials: `YANDEX_API_KEY` / `YANDEX_FOLDER_ID` env vars or the `yandex`
 section of [`config/settings.json`](config/settings.json). If Yandex is
 unavailable or the credentials are invalid, errors are logged with a clear
 category (no connection / bad key / forbidden) and the server keeps working —
-when Yandex recovers, new segments are answered as usual.
+when Yandex recovers, new utterances are answered as usual.
 
 ---
 
@@ -201,23 +226,27 @@ IDLE         — peers connected, no active audio stream
 STREAMING    — the camera is streaming audio chunks
 ```
 
-Camera events (audio/picture/face/emotion) → `Processor` (STT + stubs).
-After the STT text is recognized, a background task answers via GPT + TTS and
-plays the result back to the robot (`sm.send_robot_audio`) with the optional
-emotion command. Robot commands are sent via `sm.send_robot_move/emotion/audio`.
+Camera events (audio/picture/face/emotion) → `Processor`. Camera PCM goes
+into the persistent Yandex Realtime session; when the model finishes the
+audio answer, `state_machine` receives it via the `on_answer` callback and
+plays it back to the robot (`sm.send_robot_audio`) with the optional emotion
+command (`Emotion: <name>` from the answer text). The recognized question
+transcript comes via `on_user_text`, speech start via `on_speech_started`.
+Robot commands are sent via `sm.send_robot_move/emotion/audio`. All playback
+is serialized by a lock — the main answers and the decay phrases never mix.
 
 When a dialogue ends, [`emotion_decay.py`](src/emotion_decay.py) schedules the
 post-dialogue emotion decay: after `yandex.emotion_decay_neutral_ms` the robot
-gets Neutral, then Doubt (`doubt_ms`), then Sleepy (`sleepy_ms`); each stage
-asks GPT for a short phrase (the `yandex.emotion_decay_prompt`) and plays it
-back. A new dialogue cancels the countdown.
+gets Neutral, then Sad (`sad_ms`), then Sleepy (`sleepy_ms`); each stage asks
+the Realtime model for a short phrase (the `yandex.emotion_decay_prompt`,
+one-shot TEXT → audio) and plays it back. A new dialogue cancels the countdown.
 
 # Roadmap
 
 1. Real object detection in [`processor.detect_objects()`](src/processor.py)
    (YOLO/ONNX) and face-id handling.
-2. ~~Dialogue logic: GPT answer generation + TTS → `sm.send_robot_audio(pcm)`.~~
-   Done — see [`processor.ask()`](src/processor.py) and
-   [`state_machine._answer_worker()`](src/state_machine.py).
+2. ~~Dialogue logic: Yandex Realtime audio → audio (no STT/GPT/TTS chain).~~
+   Done — see [`processor.py`](src/processor.py) and
+   [`state_machine._on_realtime_answer()`](src/state_machine.py).
 3. Robot notification when Yandex is unavailable (voice prompt).
 4. A `set` command to change camera resolution/fps on the fly.

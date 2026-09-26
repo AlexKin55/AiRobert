@@ -4,10 +4,11 @@ After a dialogue ends (the answer playback finished) the robot is left alone:
 the server schedules an emotion countdown and at each stage:
 
 1. sends the robot the emotion command (EMOTION:<name>);
-2. asks YandexGPT for a short phrase matching that emotion (the
-   ``yandex.emotion_decay_prompt`` from settings);
-3. synthesizes the phrase via SpeechKit TTS and plays it back to the robot
-   (binary PCM frames, the same pacing as the main answers);
+2. asks the Yandex Speech Realtime model for a short phrase matching that
+   emotion and synthesizes its speech in ONE call (the
+   ``yandex.emotion_decay_prompt`` from settings; Processor.say_emotion);
+3. plays the phrase back to the robot (binary PCM frames, the same pacing as
+   the main answers);
 4. right after the Sleepy phrase — plays the yawn WAV; a short while later
    (``yandex.emotion_decay_snore_after_ms``) — the snore WAV.
 

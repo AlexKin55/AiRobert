@@ -1,55 +1,100 @@
-"""Yandex Cloud integration: speech recognition, answer generation and TTS.
+"""Yandex AI Studio Realtime API: audio question -> audio answer.
 
-STT:
-  ``StreamingRecognizer`` — streaming SpeechKit STT v3 recognition: opens
-  RecognizeStreaming on ``start()``, accepts PCM chunks via ``feed()`` as they
-  arrive (the data is streamed and recognized immediately), and on ``finish()``
-  returns the assembled text — the finalization when the utterance ends (an
-  audio pause). The text is assembled from final/final_refinement events; the
-  last partial is a fallback inside the stream (a phrase may be cut at a VAD
-  segment boundary).
+Replaces the old STT -> YandexGPT -> TTS chain with a SINGLE voice channel:
 
-GPT:
-  ``ask_gpt()`` — YandexGPT v3 (REST foundationModels/v1/completion) with the
-  system prompt from the ``yandex.system_prompt`` config; ``split_emotion()``
-  extracts the trailing "Emotion: <name>" command from the answer.
+  * ``RealtimeDialog`` — a persistent WebSocket session (one per service
+    lifetime): camera PCM goes into ``input_audio_buffer.append``, the
+    server-side VAD detects the end of the utterance, the Speech Realtime
+    model recognizes the speech, generates the answer and synthesizes the
+    speech in one pass. The finished answer arrives as
+    ``response.output_audio.delta`` chunks (PCM int16 LE mono) together with
+    the response text (``response.output_text.delta`` — used to extract the
+    trailing "Emotion: <name>" command, see ``split_emotion()``).
+  * ``ask_audio()`` — one-shot TEXT request -> audio answer over a short
+    Realtime session (used by the post-dialogue emotion decay phrases).
 
-TTS:
-  ``synthesize()`` — SpeechKit TTS v3 (REST tts/v3/utteranceSynthesis) to PCM
-  16 kHz/mono; voice/speed/role come from the ``yandex`` config section.
-  ``ask_and_synthesize()`` — GPT answer + its speech in one call.
+Realtime API protocol (Yandex AI Studio, OpenAI-compatible events):
 
-The gRPC stream lives in a separate thread, so the server asyncio loop is not
-blocked.
+  * endpoint: wss://ai.api.cloud.yandex.net/v1/realtime/openai
+      ?model=gpt://<folder_id>/speech-realtime-260528
+  * auth:     HTTP header ``Authorization: Api-Key <key>``
+  * events:   JSON objects; client -> server: ``session.update``,
+    ``input_audio_buffer.append``, ``conversation.item.create``,
+    ``response.create``; server -> client: ``session.created/updated``,
+    ``input_audio_buffer.speech_started/stopped``,
+    ``conversation.item.input_audio_transcription.completed`` (question
+    transcript), ``response.created``, ``response.output_audio.delta``,
+    ``response.output_text.delta``, ``response.done`` / ``response.cancelled``.
 
-Audio format — PCM int16 LE, 16 kHz mono (as the camera sends it and as
-SpeechKit expects: LINEAR16_PCM).
+The Realtime WS reader runs as an asyncio task, so the server asyncio loop is
+never blocked; callbacks are invoked from that task (async callbacks are
+scheduled, delivery order is preserved).
+
+Audio format — PCM int16 LE, 16 kHz mono (as the camera sends it and as the
+robot expects it), so no resampling is needed.
 
 Credentials: the ``YANDEX_API_KEY`` / ``YANDEX_FOLDER_ID`` environment
 variables or the ``yandex`` section of ``config/settings.json`` (with ${VAR}
-support). Dependencies (grpc, yandexcloud, requests) are imported lazily.
+support). The websockets dependency is imported lazily.
 """
 from __future__ import annotations
 
-import array
+import asyncio
 import base64
+import json
 import logging
 import os
-import queue
 import re
 import socket
-import struct
-import threading
 import time
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("uvicorn")
 
-# Protocol audio sample rate (STT), Hz.
-STT_SAMPLE_RATE_HZ = 16000
+# websockets protocol state enum (new API); used to check the connection
+# state across websockets 10.x–17.x.
+try:
+    from websockets.protocol import State as _WSState  # type: ignore
+except Exception:  # noqa: BLE001
+    _WSState = None
+
+
+def _ws_open(ws: Any) -> bool:
+    """True when a websockets connection is in the OPEN state.
+
+    New API (14+): ``ws.state`` is a ``State`` enum. Old API (10–13):
+    ``ws.closed`` is a bool. Returns False for any other/unknown state.
+    """
+    state = getattr(ws, "state", None)
+    if _WSState is not None and state is _WSState.OPEN:
+        return True
+    name = getattr(state, "name", None)
+    if name is not None:
+        return str(name).upper() == "OPEN"
+    closed = getattr(ws, "closed", None)
+    return closed is False
+
+
+# Protocol audio sample rate (camera input and robot output), Hz.
+SAMPLE_RATE_HZ = 16000
+
+# Yandex Realtime API (AI Studio) endpoint.
+REALTIME_HOST = "ai.api.cloud.yandex.net"
+REALTIME_PATH = "/v1/realtime/openai"
+
+# Default Realtime model (overridable via yandex.realtime_model).
+DEFAULT_MODEL = "speech-realtime-260528"
+
+# Default TTS voice for answers (overridable via yandex.voice).
+DEFAULT_VOICE = "alena"
+
+# Server-side VAD parameters for the incoming audio stream.
+VAD_THRESHOLD = 0.5
+VAD_SILENCE_MS = 400
 
 # In this network the IPv6 addresses of Yandex Cloud do not respond, while
-# requests/grpc take the FIRST address from getaddrinfo (that is IPv6) and
-# hang until a timeout. Prefer IPv4 for api.cloud.yandex.net hosts.
+# requests/websockets take the FIRST address from getaddrinfo (that is IPv6)
+# and hang until a timeout. Prefer IPv4 for *.api.cloud.yandex.net hosts.
 _orig_getaddrinfo = socket.getaddrinfo
 if socket.has_ipv6:
     def _getaddrinfo_ipv4_first(host: str, *args, **kwargs):
@@ -79,38 +124,6 @@ def get_credentials() -> tuple[str, str]:
 def credentials_ok() -> bool:
     key, folder = get_credentials()
     return bool(key and folder)
-
-
-def describe_stt_error(exc) -> str:
-    """Human-readable STT error description: down/bad credentials/blocked."""
-    try:
-        import grpc
-    except ImportError:
-        return f"Yandex STT error: {exc}"
-    code = getattr(exc, "code", None)
-    if not callable(code):
-        return f"Yandex STT error: {exc}"
-    c = code()
-    details = ""
-    d = getattr(exc, "details", None)
-    if callable(d):
-        details = d() or ""
-    mapping = {
-        grpc.StatusCode.UNAVAILABLE:
-            "Yandex STT UNAVAILABLE (no network/DNS)",
-        grpc.StatusCode.DEADLINE_EXCEEDED:
-            "Yandex STT: timeout (service did not respond)",
-        grpc.StatusCode.UNAUTHENTICATED:
-            "Yandex: INVALID CREDENTIALS (Unauthenticated) — wrong/revoked Api-Key",
-        grpc.StatusCode.PERMISSION_DENIED:
-            "Yandex: ACCESS DENIED (PermissionDenied/403) — check the folder and permissions",
-        grpc.StatusCode.NOT_FOUND:
-            "Yandex: resource not found (NotFound/404) — check folder_id",
-        grpc.StatusCode.RESOURCE_EXHAUSTED:
-            "Yandex: quota exceeded (ResourceExhausted/429)",
-    }
-    label = mapping.get(c, f"Yandex STT: error {c.name}")
-    return f"{label} [{c.name}]: {details}".strip()
 
 
 def check_connectivity(timeout_s: float = 8.0) -> dict:
@@ -168,198 +181,12 @@ def check_connectivity(timeout_s: float = 8.0) -> dict:
     return result
 
 
-class StreamingRecognizer:
-    """SpeechKit STT v3 streaming recognition — as PCM arrives.
-
-    Opens RecognizeStreaming on start(), accepts chunks via feed() and
-    returns the assembled text on finish(). The gRPC stream runs in a
-    separate thread so the server asyncio loop is not blocked.
-    """
-
-    def __init__(self, language_code: str = "ru-RU",
-                 sample_rate_hz: int = STT_SAMPLE_RATE_HZ) -> None:
-        self._q: queue.Queue = queue.Queue(maxsize=256)
-        self._texts: list[str] = []
-        # Last partial: fallback if final never arrives.
-        self._last_partial = ""
-        # Partial generation counter: each new non-empty partial increments
-        # it, drain_partial() reports only the ones not yet consumed (the
-        # first recognized word of an utterance).
-        self._partial_epoch = 0
-        self._drained_epoch = 0
-        self._err: Exception | None = None
-        self._done = threading.Event()
-        self._started = False
-        self._language = language_code
-        self._rate = sample_rate_hz
-
-    def start(self) -> None:
-        """Starts the recognition thread (gRPC stream to Yandex)."""
-        if self._started:
-            return
-        self._started = True
-        threading.Thread(target=self._run, name="stt-stream",
-                         daemon=True).start()
-
-    def feed(self, pcm: bytes) -> None:
-        """Sends the next PCM chunk into the stream (int16 LE, mono).
-
-        Non-blocking insert: on queue overflow the oldest data is dropped
-        (the fresh end of the phrase matters more than its beginning) so the
-        asyncio loop is never frozen.
-        """
-        if self._started and not self._done.is_set() and pcm:
-            while self._q.qsize() >= self._q.maxsize:
-                self._q.get_nowait()
-            self._q.put_nowait(bytes(pcm))
-
-    def finish(self, timeout_s: float = 120.0) -> str:
-        """Closes the stream and returns the recognized utterance text.
-
-        Priority: final/final_refinement. If the server did not send them
-        (the phrase was cut by VAD at the segment boundary), the last partial
-        is returned.
-        """
-        self._q.put(None)  # sentinel: end of audio
-        if not self._done.wait(timeout_s):
-            logger.warning("STT stream did not finish within %ss", timeout_s)
-        if self._err is not None:
-            logger.error("%s", describe_stt_error(self._err))
-        result = " ".join(t for t in self._texts if t).strip()
-        if not result and self._last_partial:
-            logger.info("STT: no final, using the last partial: %r",
-                        self._last_partial)
-            return self._last_partial
-        return result
-
-    def drain_partial(self) -> str:
-        """Returns the latest unrecognized partial (the first words heard).
-
-        The STT thread appends partials continuously; this method returns the
-        newest one exactly once — until the next partial arrives it returns
-        "". Safe to call from the asyncio loop (the fields are only written by
-        the STT thread, read here).
-        """
-        if self._partial_epoch > self._drained_epoch:
-            self._drained_epoch = self._partial_epoch
-            return self._last_partial
-        return ""
-
-    def abort(self) -> None:
-        """Closes the recognition stream without waiting for the result.
-
-        Used when a segment hangs (stuck gRPC stream): the audio-queue
-        sentinel makes the generator finish and the daemon thread exits on
-        its own; nobody waits for final alternatives, so the asyncio loop is
-        never blocked. Safe to call more than once.
-        """
-        try:
-            if self._started and not self._done.is_set():
-                self._q.put_nowait(None)
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _gen(self):
-        from yandex.cloud.ai.stt.v3 import stt_pb2
-
-        yield stt_pb2.StreamingRequest(
-            session_options=stt_pb2.StreamingOptions(
-                recognition_model=stt_pb2.RecognitionModelOptions(
-                    audio_format=stt_pb2.AudioFormatOptions(
-                        raw_audio=stt_pb2.RawAudio(
-                            audio_encoding=stt_pb2.RawAudio.LINEAR16_PCM,
-                            sample_rate_hertz=self._rate,
-                            audio_channel_count=1,
-                        ),
-                    ),
-                    text_normalization=stt_pb2.TextNormalizationOptions(
-                        text_normalization=(
-                            stt_pb2.TextNormalizationOptions
-                            .TEXT_NORMALIZATION_ENABLED
-                        ),
-                        profanity_filter=False,
-                        literature_text=False,
-                    ),
-                    language_restriction=stt_pb2.LanguageRestrictionOptions(
-                        restriction_type=(
-                            stt_pb2.LanguageRestrictionOptions.WHITELIST
-                        ),
-                        language_code=[self._language],
-                    ),
-                    audio_processing_type=(
-                        stt_pb2.RecognitionModelOptions.REAL_TIME
-                    ),
-                ),
-            ),
-        )
-        while True:
-            item = self._q.get()
-            if item is None:  # end of audio — close the stream
-                return
-            # Yandex accepts small AudioChunks (4000 B in the example); large
-            # camera chunks are split before sending.
-            for i in range(0, len(item), 4000):
-                yield stt_pb2.StreamingRequest(
-                    chunk=stt_pb2.AudioChunk(data=item[i:i + 4000]))
-
-    def _run(self) -> None:
-        import grpc
-        from yandex.cloud.ai.stt.v3 import stt_service_pb2_grpc
-
-        key, folder = get_credentials()
-        if not key or not folder:
-            self._err = RuntimeError(
-                "YANDEX_API_KEY / YANDEX_FOLDER_ID are not set")
-            self._done.set()
-            return
-        channel = grpc.secure_channel(
-            "stt.api.cloud.yandex.net:443", grpc.ssl_channel_credentials())
-        try:
-            stub = stt_service_pb2_grpc.RecognizerStub(channel)
-            metadata = (
-                ("authorization", f"Api-Key {key}"),
-                ("x-folder-id", folder),
-            )
-            for resp in stub.RecognizeStreaming(self._gen(),
-                                                metadata=metadata):
-                ev = resp.WhichOneof("Event")
-                if ev == "status_code":
-                    logger.debug("STT v3 status_code=%s: %s",
-                                 resp.status_code.code_type,
-                                 resp.status_code.message or "")
-                    continue
-                if ev == "partial":
-                    if (resp.partial.alternatives
-                            and resp.partial.alternatives[0].text):
-                        self._last_partial = resp.partial.alternatives[0].text
-                        self._partial_epoch += 1
-                        logger.info("STT partial: %s", self._last_partial)
-                    continue
-                if ev == "final":
-                    alts = resp.final.alternatives
-                elif ev == "final_refinement":
-                    alts = resp.final_refinement.normalized_text.alternatives
-                else:
-                    continue
-                if alts and alts[0].text:
-                    self._texts.append(alts[0].text)
-        except grpc.RpcError as exc:
-            self._err = exc
-            logger.error("%s", describe_stt_error(exc))
-        except Exception as exc:  # noqa: BLE001
-            self._err = exc
-            logger.error("Yandex STT streaming error: %s", exc)
-        finally:
-            channel.close()
-            self._done.set()
-
-
 # ---------------------------------------------------------------------------
-# YandexGPT (answer generation).
+# System prompts and the emotion command extraction.
 # ---------------------------------------------------------------------------
 
 def default_system_prompt() -> str:
-    """Default system prompt (from the yandex.system_prompt config)."""
+    """System prompt for the voice model (from yandex.system_prompt)."""
     try:
         from . import config as app_config
         return str(app_config.CONFIG.get("yandex", {}).get(
@@ -369,9 +196,9 @@ def default_system_prompt() -> str:
 
 
 def default_emotion_decay_prompt() -> str:
-    """Emotion-decay prompt (from the yandex.emotion_decay_prompt config):
-    asks GPT to generate a short phrase matching the given emotion when the
-    robot is left alone after a dialogue."""
+    """Emotion-decay prompt (from yandex.emotion_decay_prompt config):
+    asks the model to generate a short phrase matching the given emotion when
+    the robot is left alone after a dialogue."""
     try:
         from . import config as app_config
         return str(app_config.CONFIG.get("yandex", {}).get(
@@ -381,20 +208,18 @@ def default_emotion_decay_prompt() -> str:
 
 
 # Robot emotion names — the EMOTION:<name> command in the robot protocol.
-# GPT appends them to the end of the answer after the "Emotion:" keyword
-# (exactly in this form, untranslated).
+# The model appends them to the end of the answer after the "Emotion:"
+# keyword (exactly in this form, untranslated).
 ROBOT_EMOTIONS = ("neutral", "happy", "angry", "sad", "doubt", "sleepy",
                   "dancing")
 
 
-def split_emotion(text: str) -> tuple[str, str | None]:
-    """Extracts the emotion command from the end of the GPT answer.
+def split_emotion(text: str) -> tuple[str, Optional[str]]:
+    """Extracts the emotion command from the end of the model answer.
 
-    Following the prompt, GPT appends a line like "\n\nEmotion: Happy"
+    Following the prompt, the model appends a line like "\n\nEmotion: Happy"
     (values limited to ROBOT_EMOTIONS) to the end of the answer — a command
-    for the robot to show an emotion, not part of the speech: it must not
-    reach TTS and is sent to the robot as a separate EMOTION:<name> text
-    command.
+    for the robot to show an emotion, not part of the speech.
 
     Returns (text without the emotion command, emotion name or None).
     """
@@ -410,389 +235,486 @@ def split_emotion(text: str) -> tuple[str, str | None]:
     return text, None
 
 
-def ask_gpt(user_text: str, system_prompt: str = "",
-            temperature: float = 0.5, max_tokens: int = 1000) -> str:
-    """Sends text to YandexGPT v3 and returns the answer (or "" on error).
+# ---------------------------------------------------------------------------
+# Realtime session payloads.
+# ---------------------------------------------------------------------------
 
-    The model and timeout come from the config (yandex.gpt_model,
-    yandex.gpt_timeout_s). Every stage is logged with a timestamp and duration
-    so that a hung request can be localized.
+def _realtime_url(folder: str, model: str) -> str:
+    """WebSocket URL of the Realtime API for the given model URI."""
+    return (f"wss://{REALTIME_HOST}{REALTIME_PATH}"
+            f"?model=gpt://{folder}/{model}")
+
+
+def _session_payload(*, instructions: str, output_modalities: list[str],
+                     input_rate: int, output_rate: int, language: str,
+                     voice: str, role: str,
+                     turn_detection: bool,
+                     tools: Optional[list] = None) -> dict:
+    """Builds the ``session.update`` payload of a Realtime session.
+
+    output_modalities — ONE modality only (Yandex accepts either "audio" or
+    "text"; the dialog uses ["audio"], but the model still reports the
+    answer text via response.output_text.delta — used for debug/fallback).
+    turn_detection — enable the server-side VAD (continuous dialog) or not
+    (one-shot text requests).
+    tools — list of function-calling tools exposed to the model (e.g. the
+    ``emotion`` command). Instead of speaking "Emotion: Happy", the model
+    CALLS the function and the server executes it (robot emotion command).
     """
-    import requests
-
-    key, folder = get_credentials()
-    if not key or not folder:
-        raise RuntimeError("YANDEX_API_KEY / YANDEX_FOLDER_ID are not set")
-
-    model = "yandexgpt/latest"
-    timeout_s = 90.0
-    try:
-        from . import config as app_config
-        y = app_config.CONFIG.get("yandex", {})
-        model = str(y.get("gpt_model", model))
-        timeout_s = float(y.get("gpt_timeout_s", timeout_s))
-    except Exception:  # noqa: BLE001
-        pass
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "text": system_prompt})
-    messages.append({"role": "user", "text": user_text})
-
-    payload = {
-        "modelUri": f"gpt://{folder}/{model}",
-        "completionOptions": {
-            "stream": False,
-            "temperature": temperature,
-            "maxTokens": str(max_tokens),
+    session: dict[str, Any] = {
+        "type": "realtime",
+        "instructions": instructions,
+        "output_modalities": output_modalities,
+        "audio": {
+            "input": {
+                "format": {"type": "audio/pcm", "rate": input_rate},
+                "languages": [language],
+            },
+            "output": {
+                "format": {"type": "audio/pcm", "rate": output_rate},
+                "voice": voice,
+            },
         },
-        "messages": messages,
     }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Api-Key {key}",
-    }
-    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-
-    t0 = time.monotonic()
-    logger.info("GPT: POST %s model=%s text=%d chars (timeout=%ss)",
-                url, model, len(user_text), timeout_s)
-    try:
-        resp = requests.post(url, json=payload, headers=headers,
-                             timeout=(15, timeout_s))
-        dt = time.monotonic() - t0
-        logger.info("GPT: HTTP %d in %.1fs", resp.status_code, dt)
-        resp.raise_for_status()
-        data = resp.json()
-        alternatives = data.get("result", {}).get("alternatives", [])
-        if alternatives:
-            text = alternatives[0]["message"]["text"]
-            logger.info("YandexGPT: %.1fs, %d chars", time.monotonic() - t0,
-                        len(text))
-            return text
-        logger.warning("YandexGPT: %.1fs, no alternatives (reply: %s)",
-                       time.monotonic() - t0, str(data)[:300])
-    except Exception as exc:  # noqa: BLE001
-        body = ""
-        status = ""
-        r = getattr(exc, "response", None)
-        if r is not None:
-            status = r.status_code
-            body = (r.text or "")[:300]
-        logger.exception("YandexGPT error after %.1fs (HTTP=%s): %s%s%s",
-                         time.monotonic() - t0, status, exc,
-                         "; body: " if body else "", body)
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# SpeechKit TTS v3 (speech synthesis).
-# ---------------------------------------------------------------------------
-
-def _tts_settings() -> dict:
-    """TTS parameters from the config (voice/speed/role)."""
-    try:
-        from . import config as app_config
-        y = app_config.CONFIG.get("yandex", {})
-        return {
-            "voice": str(y.get("tts_voice", "zahar")),
-            "speed": float(y.get("tts_speed", 1.00)),
-            "role": str(y.get("tts_role", "friendly")),
+    if role:
+        session["audio"]["output"]["role"] = role
+    if turn_detection:
+        session["audio"]["input"]["turn_detection"] = {
+            "type": "server_vad",
+            "threshold": VAD_THRESHOLD,
+            "silence_duration_ms": VAD_SILENCE_MS,
         }
-    except Exception:  # noqa: BLE001
-        return {"voice": "zahar", "speed": 1.00, "role": "friendly"}
+    if tools:
+        session["tools"] = tools
+    return {"type": "session.update", "session": session}
 
 
-def _extract_pcm_wav(raw: bytes) -> tuple[bytes, int, int]:
-    """Extracts PCM from WAV container(s); returns (pcm, rate, channels).
+# The tool schemas (e.g. emotion) and their server-side handlers live in
+# callbacks.py (see TOOLS / dispatch); yandex.py only transports them.
 
-    SpeechKit TTS v3 returns audioChunk as WAV (RIFF/WAVE) with its own header
-    carrying the real sample rate and channel count; a single response may
-    contain several WAV sections in a row. If the buffer is not RIFF, it is
-    treated as raw PCM (16 kHz/mono).
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# Persistent Realtime dialog (audio question -> audio answer).
+# ---------------------------------------------------------------------------
+
+class RealtimeDialog:
+    """Persistent voice channel: camera PCM -> model answer PCM.
+
+    One WebSocket connection lives for the whole service lifetime; the server
+    keeps the dialog context in the session. Camera audio is fed via
+    ``feed()``; the server-side VAD closes the utterance and the model
+    responds automatically. The finished answer is delivered via the
+    ``on_answer(pcm, text)`` callback; the question transcript via
+    ``on_user_text(transcript)``; speech start via ``on_speech_started()``.
+
+    The reader runs as an asyncio task; async callbacks are scheduled as
+    tasks (delivery order is preserved), sync ones are called directly.
     """
-    if len(raw) < 12 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
-        return raw, 16000, 1
-    out = bytearray()
-    rate = 0
-    channels = 0
-    pos = 0
-    while pos + 12 <= len(raw):
-        if raw[pos:pos + 4] != b"RIFF" or raw[pos + 8:pos + 12] != b"WAVE":
-            break
-        riff_size = struct.unpack_from("<I", raw, pos + 4)[0]
-        end = min(pos + 8 + riff_size, len(raw))
-        off = pos + 12
-        got_data = False
-        while off + 8 <= end:
-            cid = raw[off:off + 4]
-            size = struct.unpack_from("<I", raw, off + 4)[0]
-            body = raw[off + 8:off + 8 + size]
-            if cid == b"fmt " and len(body) >= 16:
-                _, channels, rate, _, _, _ = struct.unpack_from(
-                    "<HHIIHH", body, 0)
-            elif cid == b"data":
-                out += body
-                got_data = True
-            off += 8 + size + (size & 1)
-        if not got_data:
-            break
-        pos = end
-    return bytes(out), rate or 16000, channels or 1
 
+    def __init__(self, *, model: str = DEFAULT_MODEL, voice: str = DEFAULT_VOICE,
+                 role: str = "", instructions: str = "",
+                 input_rate: int = SAMPLE_RATE_HZ,
+                 output_rate: int = SAMPLE_RATE_HZ,
+                 language: str = "ru-RU",
+                 tools: Optional[list] = None,
+                 on_answer: Optional[Callable[[bytes, str], Any]] = None,
+                 on_user_text: Optional[Callable[[str], Any]] = None,
+                 on_speech_started: Optional[Callable[[], Any]] = None,
+                 on_function_call: Optional[Callable[[str, dict], Any]] = None,
+                 on_error: Optional[Callable[[Exception], Any]] = None) -> None:
+        self.model = model
+        self.voice = voice
+        self.role = role
+        self.instructions = instructions
+        self.input_rate = input_rate
+        self.output_rate = output_rate
+        self.language = language
+        self.tools = list(tools) if tools else []
+        self.on_answer = on_answer
+        self.on_user_text = on_user_text
+        self.on_speech_started = on_speech_started
+        # Called with (function_name, arguments_dict) when the model calls a
+        # tool (e.g. emotion) during its answer.
+        self.on_function_call = on_function_call
+        self.on_error = on_error
+        self._ws: Any = None
+        self._reader: Optional[asyncio.Task] = None
+        self._closed = False
+        # Current answer being accumulated (reset on response.created).
+        self._pcm = bytearray()
+        self._text: list[str] = []
+        self._answering = False
+        self.started_at = 0.0
 
-def _resample_pcm(pcm: bytes, src_rate: int, dst_rate: int,
-                  channels: int = 1) -> bytes:
-    """Resamples int16 PCM to mono (linear interpolation).
+    # ------------------------------------------------------------------
+    # Connection.
+    # ------------------------------------------------------------------
+    @property
+    def connected(self) -> bool:
+        return (not self._closed and self._ws is not None
+                and _ws_open(self._ws))
 
-    With stereo input the channels are first mixed down to mono; returns
-    dst_rate PCM.
-    """
-    samples = array.array("h")
-    samples.frombytes(pcm)
-    if channels > 1:
-        samples = array.array(
-            "h", (samples[i] for i in range(0, len(samples), channels)))
-    if src_rate == dst_rate:
-        return samples.tobytes()
-    ratio = src_rate / dst_rate
-    n_out = round(len(samples) * dst_rate / src_rate)
-    out = array.array("h")
-    pos = 0.0
-    for _ in range(n_out):
-        idx = int(pos)
-        frac = pos - idx
-        a = samples[idx] if idx < len(samples) else samples[-1]
-        b = samples[idx + 1] if idx + 1 < len(samples) else a
-        out.append(int(a * (1.0 - frac) + b * frac))
-        pos += ratio
-    return out.tobytes()
+    # NOTE: Yandex Realtime accepts only ONE output modality at a time
+    # ("Modalities can be either audio or text"). The dialog uses ["audio"];
+    # whether the model also reports response.output_text.delta / the audio
+    # transcript depends on the server — it is logged for diagnostics.
 
+    async def start(self) -> None:
+        """Opens the Realtime WebSocket session and starts the reader."""
+        import websockets
 
-def clean_for_speech(text: str) -> str:
-    """Prepares text for speech synthesis: removes likely 400 triggers.
+        key, folder = get_credentials()
+        if not key or not folder:
+            raise RuntimeError("YANDEX_API_KEY / YANDEX_FOLDER_ID are not set")
+        url = _realtime_url(folder, self.model)
+        logger.info("[realtime] connecting: %s (voice=%s role=%r rate=%d/%d)",
+                    url, self.voice, self.role, self.input_rate,
+                    self.output_rate)
+        self._ws = await websockets.connect(
+            url,
+            additional_headers={"Authorization": f"Api-Key {key}"},
+            open_timeout=20.0,
+            ping_interval=20.0,
+            ping_timeout=20.0,
+            max_size=2 ** 24,
+        )
+        self._closed = False
+        self.started_at = time.monotonic()
+        await self._send(_session_payload(
+            instructions=self.instructions,
+            output_modalities=["audio"],
+            input_rate=self.input_rate,
+            output_rate=self.output_rate,
+            language=self.language,
+            voice=self.voice,
+            role=self.role,
+            turn_detection=True,
+            tools=self.tools,
+        ))
+        self._reader = asyncio.create_task(self._read_loop())
+        logger.info("[realtime] session started")
 
-    YandexGPT answers with markdown (lists '*', bold '**', links [x](url),
-    code '`', headings '#', quotes '>'), and SpeechKit TTS v3 may reject such
-    text (400 Bad Request) or read the markup literally. SSML-like '<...>'
-    (v3 parses angle brackets as markup), emojis, control characters and bare
-    URLs are additionally stripped; the text is truncated to a safe length.
-    Voice parameters are set via hints, not the text itself.
-    """
-    # markdown links [text](url) -> text, then bare URLs
-    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
-    text = re.sub(r"https?://\S+", "", text)
-    # markup ** / __ / * / _ / ` (asterisks and underscores are not needed)
-    text = re.sub(r"[*_`]", "", text)
-    # headings "# ", "## " and quotes "> " at the start of lines
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
-    # list markers "- " / "+ " at the start of lines
-    text = re.sub(r"^\s*[-+]\s+", "", text, flags=re.MULTILINE)
-    # SSML-like tags <...> and remaining angle brackets
-    text = re.sub(r"<[^>]*>", "", text)
-    text = text.replace("<", " ").replace(">", " ")
-    # emojis and pictographs (including variation selectors)
-    text = re.sub(
-        r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF"
-        r"\uFE0F\u200D\u2190-\u21FF]",
-        "", text)
-    # control characters (except \n and \t)
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
-    # excessive newlines and spaces
-    text = re.sub(r"\n{2,}", "\n", text)
-    text = re.sub(r" {2,}", " ", text)
-    text = text.strip()
-    # protection against excessive length (SpeechKit v3: up to ~5000 chars)
-    if len(text) > 5000:
-        text = text[:5000].rstrip()
-    return text
+    async def close(self) -> None:
+        """Closes the session (idempotent)."""
+        self._closed = True
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._reader is not None:
+            self._reader.cancel()
+            self._reader = None
+        self._answering = False
+        self._pcm = bytearray()
+        self._text = []
 
-
-def _tts_post(url: str, headers: dict, payload: dict) -> bytes:
-    """Single SpeechKit TTS v3 utteranceSynthesis request -> PCM (16 kHz/mono).
-
-    The response is an NDJSON stream where each chunk contains base64-WAV; the
-    real PCM is extracted from the body and resampled to 16 kHz/mono if needed.
-    On an HTTP error raises requests.HTTPError (the body is in
-    exc.response.text).
-    """
-    import json
-
-    import requests
-
-    resp = requests.post(url, json=payload, headers=headers,
-                         stream=True, timeout=120)
-    resp.raise_for_status()
-    raw = bytearray()
-    for line in resp.iter_lines():
-        if not line:
-            continue
-        chunk = json.loads(line)
-        b64 = chunk.get("result", {}).get("audioChunk", {}).get("data")
-        if b64:
-            raw += base64.b64decode(b64)
-    pcm, rate, channels = _extract_pcm_wav(bytes(raw))
-    if rate != STT_SAMPLE_RATE_HZ or channels != 1:
-        pcm = _resample_pcm(pcm, rate, STT_SAMPLE_RATE_HZ, channels)
-    return pcm
-
-
-def _split_half(text: str) -> tuple[str, str]:
-    """Splits text into two non-empty parts at a boundary near the middle.
-
-    Looks for punctuation (sentence/half-phrase) near the middle; if there is
-    none, cuts at a space, otherwise in half (safe for recursion).
-    """
-    mid = len(text) // 2
-    cut = mid
-    bounds = []
-    for sep in ".!?;…:,—":
-        i = text.rfind(sep, 0, mid)
-        if i != -1:
-            bounds.append(i + 1)
-        i = text.find(sep, mid)
-        if i != -1:
-            bounds.append(i + 1)
-    if bounds:
-        cut = min(bounds, key=lambda i: abs(i - mid))
-    else:
-        space = text.rfind(" ", 0, mid)
-        if space > 0:
-            cut = space + 1
-    left, right = text[:cut].strip(), text[cut:].strip()
-    if not left or not right:
-        cut = max(mid, 1)
-        left, right = text[:cut].strip(), text[cut:].strip()
-    return left, right
-
-
-def _synthesize_part(text: str, url: str, headers: dict,
-                     voice: str, speed: float, role: str,
-                     sample_rate_hz: int, depth: int = 0) -> bytes:
-    """Synthesizes a part of the text; on 400 'Too long text' splits in half.
-
-    The per-request text limit of SpeechKit TTS v3 can be much smaller than
-    the official 5000 characters (on some plans 'Too long text' already fires
-    at ~260 characters), so on such a 400 the text is recursively split in
-    half and each half is synthesized separately, then the PCM is joined.
-    """
-    from requests import HTTPError
-
-    payload = {
-        "text": text,
-        "outputAudioSpec": {
-            "rawData": {
-                "audioEncoding": "LINEAR16_PCM",
-                "sampleRateHertz": sample_rate_hz,
-            }
-        },
-        "hints": [
-            {"voice": voice},
-            {"speed": speed},
-            {"role": role},
-        ],
-    }
-    try:
-        t0 = time.monotonic()
-        pcm = _tts_post(url, headers, payload)
-        logger.info("TTS part(%d): %.1fs, %d B pcm", depth,
-                    time.monotonic() - t0, len(pcm))
-        return pcm
-    except HTTPError as exc:
-        body = ""
+    # ------------------------------------------------------------------
+    # Sending audio (camera -> model).
+    # ------------------------------------------------------------------
+    async def feed(self, pcm: bytes) -> None:
+        """Sends the next camera PCM chunk into the session."""
+        if not self.connected or not pcm:
+            return
         try:
-            body = getattr(exc.response, "text", "") or ""  # noqa: BLE001
-        except Exception:  # noqa: BLE001
+            await self._ws.send(json.dumps({
+                "type": "input_audio_buffer.append",
+                "audio": _b64(bytes(pcm)),
+            }))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[realtime] send error: %s", exc)
+
+    async def _send(self, obj: dict) -> None:
+        if self.connected:
+            await self._ws.send(json.dumps(obj, ensure_ascii=False))
+
+    # ------------------------------------------------------------------
+    # Reader loop and event handling.
+    # ------------------------------------------------------------------
+    async def _read_loop(self) -> None:
+        try:
+            async for raw in self._ws:
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("[realtime] non-JSON message ignored")
+                    continue
+                try:
+                    self._handle(msg)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[realtime] handler error: %s", exc)
+        except asyncio.CancelledError:
             pass
-        if "too long" not in body.lower():
-            raise
-        if len(text) <= 8:
-            # Even a minimal chunk was rejected — it is no longer about length.
-            logger.exception("Yandex TTS: short text rejected: %r (body: %s)",
-                             text, body[:400])
-            raise
-        left, right = _split_half(text)
-        logger.warning("Yandex TTS: 'Too long text' (%d chars) — splitting: "
-                       "%d + %d", len(text), len(left), len(right))
-        out = _synthesize_part(left, url, headers, voice, speed, role,
-                               sample_rate_hz, depth + 1)
-        out += _synthesize_part(right, url, headers, voice, speed, role,
-                                sample_rate_hz, depth + 1)
-        return out
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[realtime] connection lost: %s", exc)
+            self._fire(self.on_error, exc)
+        finally:
+            if not self._closed:
+                logger.warning("[realtime] reader finished (session closed)")
+                self._closed = True
+            self._ws = None
+
+    def _handle(self, msg: dict) -> None:
+        mtype = msg.get("type", "")
+        if mtype in ("session.created", "session.updated"):
+            sid = (msg.get("session") or {}).get("id", "")
+            logger.info("[realtime] %s (session id=%s)", mtype, sid)
+        elif mtype == "input_audio_buffer.speech_started":
+            logger.info("[realtime] user started speaking")
+            self._fire(self.on_speech_started)
+        elif mtype == "conversation.item.input_audio_transcription.completed":
+            transcript = str(msg.get("transcript", "")).strip()
+            if transcript:
+                logger.info("[realtime] user: %r", transcript)
+                self._fire(self.on_user_text, transcript)
+        elif mtype == "response.created":
+            self._pcm = bytearray()
+            self._text = []
+            self._answering = True
+        elif mtype == "response.output_audio.delta":
+            if self._answering:
+                try:
+                    self._pcm += base64.b64decode(msg.get("delta", ""))
+                except Exception:  # noqa: BLE001
+                    logger.warning("[realtime] bad audio delta ignored")
+        elif mtype == "response.output_text.delta":
+            if self._answering:
+                self._text.append(str(msg.get("delta", "")))
+        elif mtype == "response.output_audio.done" and self._answering:
+            transcript = ""
+            item = msg.get("item") or {}
+            content = item.get("content") or []
+            if content and isinstance(content, list):
+                parts = [c.get("transcript") for c in content
+                         if isinstance(c, dict) and c.get("transcript")]
+                transcript = " ".join(str(p) for p in parts if p)
+            logger.info("[realtime] audio done (server transcript: %r)",
+                        transcript[:120])
+        elif mtype == "response.output_item.done":
+            # Function calling: the model calls a server tool (e.g.
+            # emotion(name)) instead of speaking the command. Execute it and
+            # send back the function_call_output so the session stays
+            # consistent; the answer then finishes without extra speech.
+            item = msg.get("item") or {}
+            if item.get("type") == "function_call":
+                self._handle_function_call(item)
+        elif mtype == "response.done":
+            if self._answering:
+                self._answering = False
+                pcm = bytes(self._pcm)
+                text = "".join(self._text).strip()
+                self._pcm = bytearray()
+                self._text = []
+                if pcm:
+                    logger.info("[realtime] answer ready: %d B pcm, %d chars",
+                                len(pcm), len(text))
+                    self._fire(self.on_answer, pcm, text)
+                else:
+                    logger.info("[realtime] answer finished but empty")
+        elif mtype == "response.cancelled":
+            # The user interrupted the playback — drop the partial answer.
+            self._answering = False
+            self._pcm = bytearray()
+            self._text = []
+            logger.info("[realtime] answer cancelled")
+        elif mtype == "error":
+            detail = json.dumps(msg, ensure_ascii=False)
+            logger.error("[realtime] server error: %s", detail)
+            err = RuntimeError(f"Yandex Realtime error: {detail}")
+            self._fire(self.on_error, err)
+        else:
+            logger.debug("[realtime] event: %s", mtype)
+
+    def _handle_function_call(self, item: dict) -> None:
+        """Executes a model function call (tools / function calling).
+
+        Calls ``on_function_call(name, args)``; its return value (a string
+        or an awaitable of a string, e.g. the weather summary) is sent back
+        to the model as ``function_call_output`` followed by
+        ``response.create`` (the Realtime contract — without it the server
+        closes the session). Side-effect-only calls (emotion) return None
+        and the model must not speak anything after them.
+        """
+        call_id = str(item.get("call_id", ""))
+        name = str(item.get("name", ""))
+        args: dict = {}
+        try:
+            raw = item.get("arguments") or "{}"
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                args = parsed
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("[realtime] function_call %s: bad arguments %r",
+                           name, item.get("arguments"))
+        logger.info("[realtime] function call: %s(%s)", name, args)
+        result = None
+        if self.on_function_call is not None:
+            try:
+                result = self.on_function_call(name, args)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[realtime] function_call callback error: %s",
+                               exc)
+        asyncio.create_task(self._complete_tool_call(call_id, result))
+
+    async def _complete_tool_call(self, call_id: str,
+                                  result: Any = None) -> None:
+        """Sends function_call_output + response.create (Realtime contract).
+
+        ``result`` may be a plain string, None (→ "ok") or an awaitable
+        returning the string (e.g. the weather callback).
+        """
+        if asyncio.iscoroutine(result):
+            try:
+                result = await result
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[realtime] function_call result error: %s",
+                               exc)
+                result = None
+        output = str(result).strip() if result is not None else "ok"
+        logger.info("[realtime] function_call_output -> %s", output[:200])
+        await self._send({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            },
+        })
+        await self._send({"type": "response.create"})
+
+    def _fire(self, cb: Optional[Callable], *args: Any) -> None:
+        """Invokes a callback; coroutines are scheduled (order preserved)."""
+        if cb is None:
+            return
+        try:
+            result = cb(*args)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[realtime] callback error: %s", exc)
+            return
+        if asyncio.iscoroutine(result):
+            asyncio.create_task(self._run_coro(result))
+
+    async def _run_coro(self, coro: Any) -> None:
+        try:
+            await coro
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[realtime] async callback error: %s", exc)
 
 
-def synthesize(text: str, sample_rate_hz: int = 16000,
-               voice: str | None = None,
-               speed: float | None = None,
-               role: str | None = None) -> bytes:
-    """Speech synthesis to PCM (16 kHz/mono/16-bit) via SpeechKit TTS v3.
+# ---------------------------------------------------------------------------
+# One-shot text request -> audio answer (emotion-decay phrases).
+# ---------------------------------------------------------------------------
 
-    URL: https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis
-    The text is cleaned of markdown/special characters (clean_for_speech); on
-    400 'Too long text' it is split in half and synthesized in parts (see
-    _synthesize_part). Returns PCM bytes (or b"" on error/empty text).
+async def ask_audio(text: str, *, instructions: str = "",
+                    model: str = DEFAULT_MODEL, voice: str = DEFAULT_VOICE,
+                    role: str = "",
+                    input_rate: int = SAMPLE_RATE_HZ,
+                    output_rate: int = SAMPLE_RATE_HZ,
+                    timeout_s: float = 90.0) -> bytes:
+    """One-shot Realtime request: TEXT -> synthesized speech (PCM 16k mono).
+
+    Opens a short Realtime session, sends the text as a user message and
+    collects the ``response.output_audio.delta`` stream until ``response.done``.
+    Used by the post-dialogue emotion decay: the model both generates the
+    phrase and speaks it in a single call — no separate GPT+TTS chain.
+
+    Returns the PCM (int16 LE mono, ``output_rate`` Hz) or b"" on error/
+    timeout/empty answer. Blocks the caller up to ``timeout_s``.
     """
+    import websockets
+
     if not text or not text.strip():
         return b""
-    text = clean_for_speech(text)
-    if not text:
-        return b""
     key, folder = get_credentials()
     if not key or not folder:
         raise RuntimeError("YANDEX_API_KEY / YANDEX_FOLDER_ID are not set")
-
-    url = "https://tts.api.cloud.yandex.net:443/tts/v3/utteranceSynthesis"
-    headers = {
-        "Authorization": f"Api-Key {key}",
-        "x-folder-id": folder,
-        "Content-Type": "application/json",
-    }
-    s = _tts_settings()
-    speed_eff = float(speed if speed else s["speed"])
-    voice_eff = voice if voice else s["voice"]
-    role_eff = role if role else s["role"]
-    logger.info("TTS: voice=%s speed=%.2f role=%s (%d chars)",
-                voice_eff, speed_eff, role_eff, len(text))
-
+    url = _realtime_url(folder, model)
+    pcm = bytearray()
+    deadline = time.monotonic() + timeout_s
     t0 = time.monotonic()
+    logger.info("[realtime] ask_audio: %d chars (voice=%s role=%r, "
+                "timeout=%ss)", len(text), voice, role, timeout_s)
     try:
-        pcm = _synthesize_part(text, url, headers, voice_eff, speed_eff,
-                               role_eff, sample_rate_hz)
+        ws = await websockets.connect(
+            url,
+            additional_headers={"Authorization": f"Api-Key {key}"},
+            open_timeout=20.0,
+            ping_interval=20.0,
+            ping_timeout=20.0,
+            max_size=2 ** 24,
+        )
     except Exception as exc:  # noqa: BLE001
-        body = ""
+        logger.warning("[realtime] ask_audio connect error: %s", exc)
+        return b""
+    try:
+        await ws.send(json.dumps(_session_payload(
+            instructions=instructions,
+            output_modalities=["audio"],
+            input_rate=input_rate,
+            output_rate=output_rate,
+            language="ru-RU",
+            voice=voice,
+            role=role,
+            turn_detection=False,
+        ), ensure_ascii=False))
+        await ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        }, ensure_ascii=False))
+        await ws.send(json.dumps({"type": "response.create"}))
+        answered = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("[realtime] ask_audio timeout after %.1fs "
+                               "(%d B collected)", time.monotonic() - t0,
+                               len(pcm))
+                break
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.warning("[realtime] ask_audio timeout after %.1fs "
+                               "(%d B collected)", time.monotonic() - t0,
+                               len(pcm))
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[realtime] ask_audio recv error: %s", exc)
+                break
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            mtype = msg.get("type")
+            if mtype == "response.output_audio.delta":
+                try:
+                    pcm += base64.b64decode(msg.get("delta", ""))
+                except Exception:  # noqa: BLE001
+                    pass
+            elif mtype == "response.output_text.delta":
+                logger.info("[realtime] ask_audio partial text: %s",
+                            msg.get("delta", ""))
+            elif mtype == "response.done":
+                answered = True
+                break
+            elif mtype == "error":
+                logger.error("[realtime] ask_audio server error: %s",
+                             json.dumps(msg, ensure_ascii=False))
+                break
+    finally:
         try:
-            body = getattr(getattr(exc, "response", None), "text",
-                           "")[:800]  # noqa: BLE001
+            await ws.close()
         except Exception:  # noqa: BLE001
             pass
-        logger.exception("Yandex TTS error after %.1fs: %s%s%s",
-                         time.monotonic() - t0, exc,
-                         "\nbody: " if body else "", body)
-        return b""
-    logger.info("Yandex TTS: %.1fs, %d B pcm (16k mono)",
-                time.monotonic() - t0, len(pcm))
-    return pcm
-
-
-def ask_and_synthesize(user_text: str, system_prompt: str | None = None,
-                       temperature: float = 0.5, max_tokens: int = 1000
-                       ) -> tuple[str, bytes]:
-    """Single step: user text + prompt -> (answer text, synthesized PCM).
-
-    1. Sends the text to YandexGPT with the system prompt (from the
-       yandex.system_prompt config when not given);
-    2. Synthesizes the answer via SpeechKit TTS v3 (voice/speed/role from the
-       config).
-
-    Returns (answer, pcm); pcm may be b"" on error/empty. The answer keeps the
-    trailing "Emotion: <name>" line — use split_emotion() before TTS.
-    """
-    if system_prompt is None:
-        system_prompt = default_system_prompt()
-    answer = ask_gpt(user_text, system_prompt=system_prompt,
-                     temperature=temperature, max_tokens=max_tokens)
-    if not answer:
-        return "", b""
-    pcm = synthesize(answer)
-    return answer, pcm
+    result = bytes(pcm)
+    logger.info("[realtime] ask_audio done in %.1fs: %d B pcm "
+                "(answered=%s)", time.monotonic() - t0, len(result), answered)
+    return result if answered else b""

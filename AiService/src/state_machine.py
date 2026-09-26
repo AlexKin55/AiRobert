@@ -4,9 +4,18 @@ Architecture (two WebSockets, JSON protocol):
   * the camera connects to /camera and sends JSON: audio (base64 PCM from its
     mic), pictures (base64 JPEG), face events and face emotions; the service
     may ask it for a picture (capture) or mute/unmute the mic;
-  * the robot connects to /robot and receives JSON playback chunks
-    ({"type":"audio","audio":"<b64>"}), movements and emotions; it replies
+  * the robot connects to /robot and receives binary playback frames
+    ([type][codec][raw PCM]) plus movement/emotion commands; it replies
     with hb/ack.
+
+AI processing — the Yandex Realtime API (audio question -> audio answer):
+  * camera PCM goes straight into one persistent Realtime session
+    (Processor.process_audio); the server-side VAD detects the end of the
+    utterance and the Speech Realtime model answers in a single pass;
+  * the finished answer arrives via Processor callbacks:
+      on_answer(pcm, text)      -> emotion command + robot playback;
+      on_user_text(transcript)  -> log/debug files;
+      on_speech_started()       -> the emotion-decay countdown is postponed.
 
 States:
   DISCONNECTED — nothing connected;
@@ -24,6 +33,7 @@ from typing import Any, Dict, Optional
 from . import config as app_config
 from . import protocol as proto
 from . import recorder as recorder_mod
+from . import yandex as yandex_mod
 from .camera import CameraSession, EV_AUDIO, EV_IMAGE, EV_FACE, EV_EMOTION
 from .emotion_decay import EmotionDecay
 from .processor import Processor
@@ -44,11 +54,6 @@ PLAYBACK_DROP_TAIL_S = 2.0
 # warning is logged — the camera may have died/disconnected while the WS still
 # looks alive to the peer.
 CAMERA_SILENCE_WARN_S = 30.0
-
-# Watchdog: an STT segment open for longer than this is force-closed (the
-# gRPC stream may hang after an idle period; without the close the next
-# utterance would reuse the dead stream and the robot would stay silent).
-SEGMENT_MAX_AGE_S = 120.0
 
 
 class State(enum.Enum):
@@ -75,26 +80,32 @@ class AiStateMachine:
         except Exception:  # noqa: BLE001
             self._drop_audio = True
         self._drop_until = 0.0
-        # Background GPT+TTS answer task for the last recognized utterance.
-        self._answer_task: Optional[asyncio.Task] = None
-        self._answer_lock = asyncio.Lock()
+        # Serializes robot playback: the Realtime answer and the emotion-decay
+        # phrases share the speaker, so only one stream plays at a time.
+        self._play_lock = asyncio.Lock()
+        # Realtime answer callback (pcm, text) — the voice of the main dialog.
+        self.ai.on_answer = self._on_realtime_answer
+        # Question transcript callback (logging).
+        self.ai.on_user_text = self._on_user_text
+        # Speech-start callback: the first words restart the decay countdown.
+        self.ai.on_speech_started = self._on_speech_started
+        # Function-call emotion callback: the model CALLS emotion(name)
+        # instead of speaking it (see callbacks.emotion_tool / Realtime tools).
+        self.ai.on_emotion = self._on_realtime_emotion
+        # Function-call weather callback: returns a summary the model voices.
+        self.ai.on_weather = self._on_realtime_weather
         # Post-dialogue emotion decay (Neutral -> Sad -> Sleepy), see
-        # emotion_decay.py: GPT phrase + TTS for each stage.
+        # emotion_decay.py: one-shot Realtime phrase + playback per stage.
         self._decay = EmotionDecay(self.ai, self.robot,
-                                   send_audio=self.send_robot_audio)
-        # Any recognized speech restarts the decay countdown (the emotion
-        # change is postponed): the first STT word restarts it via
-        # _on_first_word, the final segment text — in _schedule_answer.
-        self.ai.on_partial = self._on_first_word
+                                   send_audio=self._play_audio)
         # True while the camera streams audio chunks (no segment markers in
         # the JSON protocol — the stream is continuous).
         self._streaming = False
         # Monotonic time of the last camera audio chunk (segment closing).
         self._last_audio = 0.0
-        # True while a speech segment is active (STT stream is open).
-        self._seg_active = False
-        # Monotonic time when the current STT segment was opened (watchdog).
-        self._seg_started_at = 0.0
+        # True while an _in.wav recording segment is active (closed after a
+        # pause longer than AUDIO_SEGMENT_GAP).
+        self._audio_seg_active = False
         # Playback pacing (chunk size / delivery speed) from the config.
         try:
             self._play_secs = float(
@@ -117,14 +128,11 @@ class AiStateMachine:
     async def on_camera_connected(self) -> None:
         logger.info("Camera connected: %s", self.camera.peer)
         # Fresh camera session: clear any state left from a previous
-        # connection (stuck STT segment, stale timers) so the new session
-        # starts clean and /health shows the fresh values.
+        # connection (stale timers) so the new session starts clean and
+        # /health shows the fresh values.
         self._streaming = False
         self._last_audio = 0.0
-        self._seg_started_at = 0.0
-        if self._seg_active:
-            self._seg_active = False
-            self.ai.reset_segment()
+        self._audio_seg_active = False
         if self.rec is not None:
             self.rec.close_audio()
         self._update_state()
@@ -132,15 +140,9 @@ class AiStateMachine:
     async def on_camera_disconnected(self) -> None:
         logger.info("Camera disconnected")
         self._streaming = False
+        self._audio_seg_active = False
         if self.rec is not None:
             self.rec.close_audio()
-        # Disconnect in the middle of an utterance: finalize STT and save
-        # whatever was recognized.
-        if self._seg_active:
-            self._seg_active = False
-            text = await self.ai.end_segment()
-            if text and self.rec is not None:
-                self.rec.save_stt_text(text)
         self._update_state()
 
     async def on_robot_connected(self) -> None:
@@ -166,7 +168,7 @@ class AiStateMachine:
 
     # ------------------------------------------------------------------
     # Watchdog (started by the server lifespan): silent-camera diagnostics
-    # and stuck-STT-segment recovery.
+    # and Realtime-session recovery.
     # ------------------------------------------------------------------
     async def run_watchdog(self) -> None:
         """Periodic diagnostics loop (every 10 s).
@@ -174,9 +176,8 @@ class AiStateMachine:
         * If the camera is connected but sends NOTHING (no audio, no HB) for
           a long time — a warning is logged (the camera may be dead/hung
           while its WS peer still looks alive).
-        * If an STT segment stays open for too long — it is force-closed so
-          the next utterance starts a fresh recognition stream (a hung gRPC
-          stream would otherwise keep the robot silent forever).
+        * If the persistent Yandex Realtime session went down — it is
+          reconnected so the next utterance is answered as usual.
         """
         while True:
             await asyncio.sleep(10.0)
@@ -191,14 +192,8 @@ class AiStateMachine:
                             "peer=%s)", max(age, 0.0), self.camera.peer)
                 elif self.robot.connected:
                     logger.warning("[camera] not connected (robot is online)")
-                if (self._seg_active and self._seg_started_at
-                        and now - self._seg_started_at > SEGMENT_MAX_AGE_S):
-                    logger.warning(
-                        "[ai] STT segment stuck for %.0f s — resetting it",
-                        now - self._seg_started_at)
-                    self._seg_active = False
-                    self._seg_started_at = 0.0
-                    self.ai.reset_segment()
+                if self.ai.enabled and not self.ai.connected:
+                    await self.ai.ensure_running()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[ai] watchdog error: %s", exc)
 
@@ -221,18 +216,13 @@ class AiStateMachine:
                 if self._drop_audio and now < self._drop_until:
                     logger.debug("[camera] audio dropped during playback")
                     continue
-                # The first chunk after a pause = start of a new utterance:
-                # open the Yandex STT recognition stream. The emotion decay
-                # is NOT restarted here (the camera often produces false
-                # segments from background noise, "empty text") — it is
-                # postponed by non-empty STT results: on the first recognized
-                # word (on_partial -> _on_first_word) and once more when the
-                # final segment text arrives (_schedule_answer).
-                if not self._seg_active or \
+                # The first chunk after a pause = start of a new recording
+                # segment (a new _in.wav is created by the recorder). The
+                # audio itself goes into the persistent Realtime session —
+                # the server-side VAD closes the utterance there.
+                if not self._audio_seg_active or \
                         now - self._last_audio >= AUDIO_SEGMENT_GAP:
-                    await self.ai.begin_segment()
-                    self._seg_active = True
-                    self._seg_started_at = time.monotonic()
+                    self._audio_seg_active = True
                 self._last_audio = now
                 self._streaming = True
                 self._update_state()
@@ -249,21 +239,14 @@ class AiStateMachine:
                 await self.ai.on_face(event[1], event[2])
             elif kind == EV_EMOTION:
                 await self.ai.on_camera_emotion(event[1])
-        # An audio pause = end of the utterance: finalize _in.wav and the STT
-        # stream, save the recognized text next to the WAV (<stamp>_in.txt),
-        # then generate the robot answer (GPT + TTS) in the background.
+        # An audio pause = end of the recording segment: finalize _in.wav.
+        # (The Realtime VAD ends the utterance on its own, faster.)
         if (self._last_audio
                 and time.monotonic() - self._last_audio >= AUDIO_SEGMENT_GAP):
             if self.rec is not None:
                 if self.rec.close_audio():
                     logger.info("[camera] audio pause: _in.wav segment closed")
-            if self._seg_active:
-                self._seg_active = False
-                text = await self.ai.end_segment()
-                if text and self.rec is not None:
-                    self.rec.save_stt_text(text)
-                if text:
-                    self._schedule_answer(text)
+            self._audio_seg_active = False
         self._update_state()
         await self.camera.send_text(proto.ok_message())
 
@@ -275,54 +258,147 @@ class AiStateMachine:
         await self.ai.on_robot_text(text)
 
     # ------------------------------------------------------------------
-    # Answer pipeline: GPT + TTS -> robot playback (background).
+    # Realtime answer pipeline (audio question -> audio answer).
     # ------------------------------------------------------------------
-    def _schedule_answer(self, text: str) -> None:
-        """Starts the answer pipeline (GPT + TTS -> robot playback).
+    def _on_speech_started(self) -> None:
+        """The user started speaking — postpone the emotion decay.
 
-        A background task keeps the camera message loop unblocked while the
-        answer is generated; the lock serializes overlapping answers (a new
-        utterance while the previous one is still being processed is skipped).
+        Called by Processor as soon as the Realtime VAD reports speech, so
+        the decay countdown restarts immediately when the user starts
+        speaking (not after the whole answer). start() cancels the previous
+        run internally.
         """
-        # Recognized speech — restart the decay countdown: the emotion change
-        # is postponed by the whole delay again (already restarted by the
-        # first word; this is the safety net for segments without partials).
-        # An empty-text segment never reaches this point, so false camera
-        # triggers cannot kill the decay.
+        logger.info("[ai] speech started — restarting decay")
         self._decay.start()
-        if self._answer_task is not None and not self._answer_task.done():
-            logger.warning("[ai] answer task still busy — skipping utterance")
+
+    async def _on_user_text(self, transcript: str) -> None:
+        """Question transcript from the Realtime session — log only (the
+        debug files are saved by the Processor)."""
+        logger.info("[ai] user said: %r", transcript)
+
+    async def _on_realtime_emotion(self, name: str) -> None:
+        """Emotion from the model's function call (tools / function calling).
+
+        The model calls ``emotion(name)`` instead of speaking the command, so
+        the answer audio never contains "Emotion: ...". The robot gets the
+        EMOTION:<name> text command.
+        """
+        if name not in proto.ROBOT_EMOTIONS:
+            logger.warning("[ai] emotion function call: unknown %r", name)
             return
-        self._answer_task = asyncio.create_task(self._answer_worker(text))
+        logger.info("[ai] answer emotion (function call) -> %s", name)
+        await self.send_robot_emotion(name)
 
-    def _on_first_word(self, part: str) -> None:
-        """First STT-recognized word of a new utterance — postpone the decay.
+    async def _on_realtime_weather(self, city: str) -> str:
+        """Weather from the model's function call (tools / function calling).
 
-        Called by Processor.process_audio() from the asyncio loop as soon as
-        SpeechKit reports a non-empty partial, so the decay countdown is
-        restarted immediately when the user starts speaking (not after the
-        whole segment ends). start() internally cancels the previous run.
+        Uses the Yandex Weather REST API v2/forecast (X-Yandex-Weather-Key,
+        key from ``yandex.weather_api_key`` config or the
+        YANDEX_WEATHER_API_KEY env); the city is resolved to coordinates via
+        the Open-Meteo geocoder (no key required). Returns a short Russian
+        summary which goes back to the model as function_call_output and is
+        voiced to the user.
         """
-        logger.info("[ai] first word heard (%r) — restarting decay", part)
-        self._decay.start()
+        import os
 
-    async def _answer_worker(self, text: str) -> None:
-        """Background worker: recognizes -> GPT answer -> TTS -> playback."""
+        import requests
+        from urllib.parse import quote
+
+        key = os.environ.get("YANDEX_WEATHER_API_KEY", "").strip() or \
+            str(app_config.CONFIG.get("yandex", {}).get(
+                "weather_api_key", "")).strip()
+        if not key:
+            logger.warning("[ai] weather(%r): no Yandex Weather API key "
+                           "(yandex.weather_api_key / YANDEX_WEATHER_API_KEY)",
+                           city)
+            return (f"Не могу получить погоду: не задан ключ Яндекс Погоды. "
+                    f"Добавьте weather_api_key в настройки сервиса.")
         try:
-            async with self._answer_lock:
-                result = await self.ai.ask(text)
-                if not result:
-                    return
-                pcm, emotion = result
-                if emotion:
-                    logger.info("[ai] answer emotion -> %s", emotion)
-                    await self.send_robot_emotion(emotion)
-                if pcm:
-                    await self.send_robot_audio(pcm)
-                # Dialogue finished — schedule the emotion decay countdown.
-                self._decay.start()
+            # City -> coordinates (Open-Meteo geocoder, free, works without key).
+            geo = await asyncio.to_thread(
+                requests.get,
+                f"https://geocoding-api.open-meteo.com/v1/search"
+                f"?name={quote(city)}&count=1&language=ru&format=json",
+                timeout=8.0)
+            results = (geo.json() or {}).get("results") or []
+            if not results:
+                return f"Не удалось найти город {city}."
+            lat = results[0]["latitude"]
+            lon = results[0]["longitude"]
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[ai] answer pipeline error: %s", exc)
+            logger.warning("[ai] weather(%r) geocoding error: %s", city, exc)
+            return f"Не удалось определить координаты города {city}."
+        try:
+            resp = await asyncio.to_thread(
+                requests.get,
+                f"https://api.weather.yandex.ru/v2/forecast"
+                f"?lat={lat}&lon={lon}&lang=ru_RU",
+                headers={"X-Yandex-Weather-Key": key},
+                timeout=10.0)
+            payload = resp.json()
+            fact = payload.get("fact") or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ai] weather(%r) request error: %s", city, exc)
+            return f"Не удалось получить погоду для города {city}."
+        try:
+            temp = fact.get("temp")
+            desc = self._weather_desc(fact.get("condition"))
+            wind = fact.get("wind_speed")
+            parts = [f"В городе {city} сейчас {desc}"]
+            if temp is not None:
+                parts.append(f"температура {temp} градусов")
+            if wind is not None:
+                parts.append(f"ветер {wind} метров в секунду")
+            return ", ".join(parts) + "."
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ai] weather(%r) parse error: %s", city, exc)
+            return f"Не удалось получить погоду для города {city}."
+
+    @staticmethod
+    def _weather_desc(condition: Any) -> str:
+        """Maps the Yandex Weather v2 ``fact.condition`` code to Russian."""
+        cond_map = {
+            "clear": "ясно",
+            "partly-cloudy": "переменная облачность",
+            "cloudy": "облачно с прояснениями",
+            "overcast": "пасмурно",
+            "drizzle": "морось",
+            "light-rain": "небольшой дождь",
+            "rain": "дождь",
+            "moderate-rain": "умеренный дождь",
+            "heavy-rain": "сильный дождь",
+            "continuous-heavy-rain": "длительный сильный дождь",
+            "showers": "ливень",
+            "wet-snow": "дождь со снегом",
+            "light-snow": "небольшой снег",
+            "snow": "снег",
+            "snow-showers": "снегопад",
+            "hail": "град",
+            "thunderstorm": "гроза",
+            "thunderstorm-with-rain": "гроза с дождём",
+            "thunderstorm-with-hail": "гроза с градом",
+        }
+        return cond_map.get(str(condition).lower(),
+                            str(condition).lower().replace("-", " "))
+
+    async def _on_realtime_answer(self, pcm: bytes, text: str) -> None:
+        """Full model answer from the Realtime session: emotion + playback.
+
+        Runs in the background (scheduled by the Processor); the playback
+        lock serializes it against emotion-decay phrases so the robot never
+        mixes two streams. The primary emotion path is the function call
+        (``_on_realtime_emotion``); the trailing "Emotion: <name>" line in
+        the text is a fallback for models that ignore the tool.
+        """
+        self._decay.cancel()
+        _, emotion = yandex_mod.split_emotion(text)
+        if emotion:
+            logger.info("[ai] answer emotion (text fallback) -> %s", emotion)
+            await self.send_robot_emotion(emotion)
+        if pcm:
+            await self._play_audio(pcm)
+        # Dialogue finished — schedule the emotion decay countdown.
+        self._decay.start()
 
     # ------------------------------------------------------------------
     # Service -> robot actions.
@@ -332,6 +408,11 @@ class AiStateMachine:
 
     async def send_robot_emotion(self, name: str) -> bool:
         return await self.robot.send_emotion(name)
+
+    async def _play_audio(self, pcm: bytes) -> bool:
+        """Robot playback serialized by _play_lock (one stream at a time)."""
+        async with self._play_lock:
+            return await self.send_robot_audio(pcm)
 
     async def send_robot_audio(self, pcm: bytes) -> bool:
         """Sends playback PCM to the robot as binary frames.
@@ -417,8 +498,9 @@ class AiStateMachine:
             if self.camera.last_activity else None,
             "last_audio_age_s": round(now - self._last_audio, 1)
             if self._last_audio else None,
-            "seg_active": self._seg_active,
+            "audio_seg_active": self._audio_seg_active,
             "decay_running": self._decay.running,
+            "ai": self.ai.health(),
             "camera": {
                 "device": self.camera.device,
                 "frames": self.camera.frames_total,
