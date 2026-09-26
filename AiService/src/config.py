@@ -45,6 +45,10 @@ _DEFAULTS: Dict[str, Any] = {
         "play_speed": 1.0,
         "drop_audio_during_playback": True,
     },
+    "touch": {
+        "enabled": True,
+        "sound_file": "sounds/touch.wav",
+    },
     "yandex": {
         "api_key": "",
         "folder_id": "",
@@ -58,13 +62,15 @@ _DEFAULTS: Dict[str, Any] = {
         "voice": "alena",
         "role": "",
         "weather_api_key": "",
-        "emotion_decay_prompt": "",
-        "emotion_decay_neutral_ms": 10000,
-        "emotion_decay_sad_ms": 30000,
-        "emotion_decay_sleepy_ms": 45000,
-        "emotion_decay_yawn_file": "sounds/yawn.wav",
-        "emotion_decay_snore_file": "sounds/snore.wav",
-        "emotion_decay_snore_after_ms": 5000,
+    },
+    "emotion_decay": {
+        "prompt": "",
+        "neutral_min": 0.17,
+        "sad_min": 0.5,
+        "sleepy_min": 0.75,
+        "snore_after_min": 0.08,
+        "yawn_file": "sounds/yawn.wav",
+        "snore_file": "sounds/snore.wav",
     },
 }
 

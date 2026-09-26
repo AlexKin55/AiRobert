@@ -10,6 +10,7 @@
 #include "move/move.h"
 #include "screen/screen.h"
 #include "sound/sound.h"
+#include "touch/touch.h"
 #include "websocket/websocket.h"
 #include "wifi/wifi.h"
 
@@ -77,6 +78,8 @@ class RobotStateMachine
 
     void sendHeartbeat();
     void sendAck(const std::string& command);
+    // Sends a head-touch event {"type":"touch","action":...} to the server.
+    void sendTouchEvent(TouchGesture gesture);
 
     EspWifiManager wifi_;
     EspWebsocketClient ws_;
@@ -94,6 +97,8 @@ class RobotStateMachine
     // Millis of the last heartbeat / reconnect attempt.
     uint32_t lastHbMs_ = 0;
     uint32_t lastReconnectMs_ = 0;
+    // Total head-touch events reported to the server.
+    uint32_t touchEvents_ = 0;
 };
 
 #endif  // AIBOT_STATE_MACHINE_H_

@@ -35,7 +35,7 @@ from . import protocol as proto
 from . import recorder as recorder_mod
 from . import yandex as yandex_mod
 from .camera import CameraSession, EV_AUDIO, EV_IMAGE, EV_FACE, EV_EMOTION
-from .emotion_decay import EmotionDecay
+from .emotion_decay import EmotionDecay, _load_pcm
 from .processor import Processor
 from .robot import RobotSession
 
@@ -98,6 +98,17 @@ class AiStateMachine:
         # emotion_decay.py: one-shot Realtime phrase + playback per stage.
         self._decay = EmotionDecay(self.ai, self.robot,
                                    send_audio=self._play_audio)
+        # Head-touch response (touch section): when the robot reports a touch
+        # event, play sound_file on it (see _play_touch_sound).
+        try:
+            _t = app_config.CONFIG.get("touch", {})
+            self._touch_enabled = bool(_t.get("enabled", True))
+            self._touch_sound_file = str(_t.get("sound_file",
+                                                "sounds/touch.wav"))
+        except Exception:  # noqa: BLE001
+            self._touch_enabled = True
+            self._touch_sound_file = "sounds/touch.wav"
+        self._touch_pcm: Optional[bytes] = None
         # True while the camera streams audio chunks (no segment markers in
         # the JSON protocol — the stream is continuous).
         self._streaming = False
@@ -253,8 +264,14 @@ class AiStateMachine:
     # ------------------------------------------------------------------
     # JSON message from the robot.
     # ------------------------------------------------------------------
+    # JSON message from the robot.
+    # ------------------------------------------------------------------
     async def on_robot_message(self, text: str) -> None:
-        self.robot.note_message(text)
+        mtype = self.robot.note_message(text)
+        if mtype == proto.MSG_TOUCH and self._touch_enabled:
+            # The robot shows a happy face and plays the touch sound.
+            await self.send_robot_emotion("happy")
+            await self._play_touch_sound()
         await self.ai.on_robot_text(text)
 
     # ------------------------------------------------------------------
@@ -401,6 +418,27 @@ class AiStateMachine:
         self._decay.start()
 
     # ------------------------------------------------------------------
+    # Head-touch response (robot -> server -> playback).
+    # ------------------------------------------------------------------
+    def _load_touch_pcm(self) -> bytes:
+        """Loads/caches the touch response WAV as PCM (16k mono)."""
+        if self._touch_pcm is None:
+            self._touch_pcm = _load_pcm(self._touch_sound_file)
+        return self._touch_pcm
+
+    async def _play_touch_sound(self) -> None:
+        """Plays the touch response sound on the robot (touch section).
+
+        The sound shares the playback lock with speech, so it never overlaps
+        an answer; a missing/broken file is skipped silently.
+        """
+        pcm = self._load_touch_pcm()
+        if not pcm:
+            return
+        logger.info("PLAY: touch sound %d B", len(pcm))
+        await self._play_audio(pcm)
+
+    # ------------------------------------------------------------------
     # Service -> robot actions.
     # ------------------------------------------------------------------
     async def send_robot_move(self, axis: str, degrees: int = 0) -> bool:
@@ -516,5 +554,7 @@ class AiStateMachine:
                 "emotion_commands": self.robot.emotion_commands,
                 "playback_bytes": self.robot.playback_bytes,
                 "last_ack": self.robot.last_ack,
+                "touch_events": self.robot.touch_events,
+                "last_touch": self.robot.last_touch,
             },
         }

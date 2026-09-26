@@ -38,7 +38,7 @@ Host/port: `HOST=... PORT=... ./scripts/run_server.sh` or the env vars
 [`config/settings.json`](config/settings.json)).
 
 Diagnostics: `GET /health` — state, connection flags, statistics (frames,
-PCM bytes, robot commands, last face).
+PCM bytes, robot commands, last face, last head-touch).
 
 Test without the camera:
 
@@ -195,10 +195,11 @@ with an empty `[type][codec]` frame (EOF).
 
 ## Robot → server
 
-| type  | example                                    |
-|-------|--------------------------------------------|
-| `hb`  | `{"type":"hb"}`                            |
-| `ack` | `{"type":"ack","command":"MOVE:left:60"}` — movement done |
+| type    | example                                    |
+|---------|--------------------------------------------|
+| `hb`    | `{"type":"hb"}`                            |
+| `ack`   | `{"type":"ack","command":"MOVE:left:60"}` — movement done |
+| `touch` | `{"type":"touch","action":"press"}` — head touch: `press`, `release`, `swipe_forward`, `swipe_backward` (Si12T sensor) |
 
 ---
 
@@ -236,10 +237,12 @@ Robot commands are sent via `sm.send_robot_move/emotion/audio`. All playback
 is serialized by a lock — the main answers and the decay phrases never mix.
 
 When a dialogue ends, [`emotion_decay.py`](src/emotion_decay.py) schedules the
-post-dialogue emotion decay: after `yandex.emotion_decay_neutral_ms` the robot
-gets Neutral, then Sad (`sad_ms`), then Sleepy (`sleepy_ms`); each stage asks
-the Realtime model for a short phrase (the `yandex.emotion_decay_prompt`,
-one-shot TEXT → audio) and plays it back. A new dialogue cancels the countdown.
+post-dialogue emotion decay: after `neutral_min` the robot gets Neutral, then
+Sad (`sad_min`), then Sleepy (`sleepy_min`) — the delays (in MINUTES), the
+`prompt` and the sound files live in the separate `emotion_decay` section of
+[`config/settings.json`](config/settings.json); each stage asks the Realtime
+model for a short phrase (one-shot TEXT → audio) and plays it back. A new
+dialogue cancels the countdown.
 
 # Roadmap
 

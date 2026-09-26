@@ -30,6 +30,7 @@
 
 #include "config/config.h"
 #include "log/log.h"
+#include "touch/touch.h"
 
 namespace {
 
@@ -143,6 +144,26 @@ const char* emotionName(Emotion e)
     return "Unknown";
 }
 
+// Protocol value of a touch gesture (robot -> server {"type":"touch",
+// "action":...}): press/release/swipe_forward/swipe_backward.
+const char* touchActionName(TouchGesture gesture)
+{
+    switch (gesture)
+    {
+        case TouchGesture::Press:
+            return "press";
+        case TouchGesture::Release:
+            return "release";
+        case TouchGesture::SwipeForward:
+            return "swipe_forward";
+        case TouchGesture::SwipeBackward:
+            return "swipe_backward";
+        case TouchGesture::None:
+        default:
+            return "none";
+    }
+}
+
 uint64_t nowUs()
 {
     return static_cast<uint64_t>(micros());
@@ -173,6 +194,7 @@ bool RobotStateMachine::begin()
 {
     screen_.begin();
     movement_.begin();
+    TouchSensor::begin();
 
     // Connect to the access point (blocking, up to WIFI_CONNECT_TIMEOUT_MS).
     if (!wifi_.connect(WIFI_SSID, WIFI_PASS, WIFI_CONNECT_TIMEOUT_MS))
@@ -233,6 +255,14 @@ void RobotStateMachine::loop()
 
     // Service the WebSocket network (events/data arrive here).
     ws_.loop();
+
+    // Head touch sensor: report touches/swipes to the server (text JSON
+    // {"type":"touch","action":"..."}, see sendTouchEvent).
+    const TouchGesture gesture = TouchSensor::update();
+    if (gesture != TouchGesture::None)
+    {
+        sendTouchEvent(gesture);
+    }
 }
 
 void RobotStateMachine::onWsConnected()
@@ -529,4 +559,18 @@ void RobotStateMachine::sendAck(const std::string& command)
              command.c_str(), static_cast<unsigned long long>(nowUs()));
     ws_.sendText(msg);
     LOG_D("[robot] ack: %s\n", command.c_str());
+}
+
+void RobotStateMachine::sendTouchEvent(TouchGesture gesture)
+{
+    ++touchEvents_;
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "{\"type\":\"touch\",\"action\":\"%s\",\"timestamp\":%llu}",
+             touchActionName(gesture),
+             static_cast<unsigned long long>(nowUs()));
+    const bool ok = ws_.sendText(msg);
+    LOG_I("[robot] touch #%u: %s -> %s\n",
+          static_cast<unsigned>(touchEvents_), touchActionName(gesture),
+          ok ? "ok" : "no connection");
 }

@@ -196,13 +196,13 @@ def default_system_prompt() -> str:
 
 
 def default_emotion_decay_prompt() -> str:
-    """Emotion-decay prompt (from yandex.emotion_decay_prompt config):
+    """Emotion-decay prompt (from the ``emotion_decay`` config section):
     asks the model to generate a short phrase matching the given emotion when
     the robot is left alone after a dialogue."""
     try:
         from . import config as app_config
-        return str(app_config.CONFIG.get("yandex", {}).get(
-            "emotion_decay_prompt", ""))
+        return str(app_config.CONFIG.get("emotion_decay", {}).get(
+            "prompt", ""))
     except Exception:  # noqa: BLE001
         return ""
 

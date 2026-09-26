@@ -30,6 +30,9 @@ class RobotSession(WsSession):
         self.emotion_commands = 0
         self.playback_bytes = 0
         self.last_ack: Optional[str] = None
+        # Head-touch events (robot -> server): press/release/swipe_*.
+        self.touch_events = 0
+        self.last_touch: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Actions service -> robot.
@@ -70,17 +73,24 @@ class RobotSession(WsSession):
     # ------------------------------------------------------------------
     # Text from the robot (JSON: hb, ack).
     # ------------------------------------------------------------------
-    def note_message(self, text: str) -> None:
+    def note_message(self, text: str) -> Optional[str]:
+        """Parses and logs a robot text message; returns its type or None."""
         msg = proto.parse_message(text)
         if msg is None:
             logger.info("[robot] non-JSON text: %s", text[:64])
-            return
+            return None
         mtype = msg.get("type")
         if mtype == proto.MSG_HB:
             logger.info("[robot] HB from %s", self.peer)
-            return
-        if mtype == proto.MSG_ACK:
+        elif mtype == proto.MSG_ACK:
             self.last_ack = str(msg.get("command", ""))
             logger.info("[robot] ack: %s", self.last_ack)
-            return
-        logger.info("[robot] message: %s", text[:128])
+        elif mtype == proto.MSG_TOUCH:
+            action = str(msg.get("action", ""))
+            self.touch_events += 1
+            self.last_touch = action
+            logger.info("[robot] touch: %r (total %d)",
+                        action, self.touch_events)
+        else:
+            logger.info("[robot] message: %s", text[:128])
+        return mtype

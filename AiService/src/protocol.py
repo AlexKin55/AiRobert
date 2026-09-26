@@ -57,6 +57,7 @@ MSG_UNMUTE = "unmute"
 MSG_CAPTURE = "capture"
 MSG_MOVEMENT = "movement"
 MSG_ACK = "ack"
+MSG_TOUCH = "touch"
 
 # Robot emotion names (validated before sending).
 ROBOT_EMOTIONS = (
@@ -65,6 +66,9 @@ ROBOT_EMOTIONS = (
 
 # Robot movement axes (validated before sending).
 ROBOT_AXES = ("left", "right", "up", "down", "center")
+
+# Head-touch actions sent by the robot ({"type":"touch","action":...}).
+TOUCH_ACTIONS = ("press", "release", "swipe_forward", "swipe_backward")
 
 # Binary audio frame layout (server -> robot): byte[0] = type,
 # byte[1] = codec, then raw PCM payload. The only codec is 1:
