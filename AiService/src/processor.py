@@ -300,10 +300,14 @@ class Processor:
         return []
 
     async def on_face(self, face_id: str,
-                      confidence: Any = None) -> None:
+                      confidence, pan, tilte) -> None:
         """Recognized-face event from the camera. Stub: log only."""
-        logger.info("[ai] face: id=%r confidence=%s (stub)",
-                    face_id, confidence)
+        logger.info("[ai] face: id=%r confidence=%s (stub), pan=%s, tilte=%s",
+                    face_id, confidence, pan, tilte)
+        if confidence < 0.80:
+            return None
+
+        return pan, tilte
 
     async def on_camera_emotion(self, emotion: str) -> None:
         """Face emotion recognized by the camera. Stub: log only."""

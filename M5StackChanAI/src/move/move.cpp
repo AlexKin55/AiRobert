@@ -53,7 +53,7 @@ bool EspMovement::begin()
     return true;
 }
 
-void EspMovement::apply()
+void EspMovement::apply(bool block)
 {
     if (!initialized_)
     {
@@ -61,10 +61,11 @@ void EspMovement::apply()
     }
     M5StackChan.Motion.moveX(panDeg_ * kDegToMotion, kMotionSpeed);
     M5StackChan.Motion.moveY(tiltDeg_ * kDegToMotion, kMotionSpeed);
-    waitMotion();
+    if (block)
+        waitMotion();
 }
 
-void EspMovement::center()
+void EspMovement::center(bool block)
 {
     panDeg_ = 0;
     tiltDeg_ = 0;
@@ -73,43 +74,51 @@ void EspMovement::center()
         return;
     }
     M5StackChan.Motion.goHome(kMotionSpeed);
-    waitMotion();
+    if (block)
+        waitMotion();
 }
 
 void EspMovement::turnLeft(int degrees)
 {
-    panDeg_ = clampAngle(panDeg_ + degrees, config_.minAngle, config_.maxAngle);
+    panDeg_ = clampAngle(panDeg_ + degrees, config_.minXAngle, config_.maxXAngle);
     apply();
 }
 
 void EspMovement::turnRight(int degrees)
 {
-    panDeg_ = clampAngle(panDeg_ - degrees, config_.minAngle, config_.maxAngle);
+    panDeg_ = clampAngle(panDeg_ - degrees, config_.minXAngle, config_.maxXAngle);
     apply();
 }
 
 void EspMovement::turnUp(int degrees)
 {
-    tiltDeg_ = clampAngle(tiltDeg_ + degrees, config_.minAngle, config_.maxAngle);
+    tiltDeg_ = clampAngle(tiltDeg_ + degrees, config_.minYAngle, config_.maxYAngle);
     apply();
 }
 
 void EspMovement::turnDown(int degrees)
 {
-    tiltDeg_ = clampAngle(tiltDeg_ - degrees, config_.minAngle, config_.maxAngle);
+    tiltDeg_ = clampAngle(tiltDeg_ - degrees, config_.minYAngle, config_.maxYAngle);
+    apply();
+}
+
+void EspMovement::setPanAndTilt(int pan, int tilt)
+{
+    panDeg_ = clampAngle(pan, config_.minXAngle, config_.maxXAngle);
+    tiltDeg_ = clampAngle(tilt, config_.minYAngle, config_.maxYAngle);
     apply();
 }
 
 void EspMovement::setPan(int degrees)
 {
-    panDeg_ = clampAngle(degrees, config_.minAngle, config_.maxAngle);
-    apply();
+    panDeg_ = clampAngle(degrees, config_.minXAngle, config_.maxXAngle);
+    apply(false);
 }
 
 void EspMovement::setTilt(int degrees)
 {
-    tiltDeg_ = clampAngle(degrees, config_.minAngle, config_.maxAngle);
-    apply();
+    tiltDeg_ = clampAngle(degrees, config_.minYAngle, config_.maxYAngle);
+    apply(false);
 }
 
 int EspMovement::panDeg() const

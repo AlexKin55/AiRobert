@@ -146,6 +146,7 @@ class AiStateMachine:
         self._audio_seg_active = False
         if self.rec is not None:
             self.rec.close_audio()
+        self.send_robot_move(0,0)
         self._update_state()
 
     async def on_camera_disconnected(self) -> None:
@@ -247,7 +248,11 @@ class AiStateMachine:
                 if detections:
                     logger.info("Objects detected: %d", len(detections))
             elif kind == EV_FACE:
-                await self.ai.on_face(event[1], event[2])
+                movement = await self.ai.on_face(event[1], event[2], event[3], event[4])
+                if movement is not None:
+                    pan, tilte = movement
+                    await self.send_robot_move(pan, tilte)
+
             elif kind == EV_EMOTION:
                 await self.ai.on_camera_emotion(event[1])
         # An audio pause = end of the recording segment: finalize _in.wav.
@@ -261,8 +266,6 @@ class AiStateMachine:
         self._update_state()
         await self.camera.send_text(proto.ok_message())
 
-    # ------------------------------------------------------------------
-    # JSON message from the robot.
     # ------------------------------------------------------------------
     # JSON message from the robot.
     # ------------------------------------------------------------------
@@ -441,8 +444,8 @@ class AiStateMachine:
     # ------------------------------------------------------------------
     # Service -> robot actions.
     # ------------------------------------------------------------------
-    async def send_robot_move(self, axis: str, degrees: int = 0) -> bool:
-        return await self.robot.send_movement(axis, degrees)
+    async def send_robot_move(self, pan, tilte) -> bool:
+        return await self.robot.send_movement(pan, tilte)
 
     async def send_robot_emotion(self, name: str) -> bool:
         return await self.robot.send_emotion(name)

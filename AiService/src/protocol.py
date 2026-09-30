@@ -182,11 +182,8 @@ def robot_audio_message(pcm: bytes) -> str:
     return make_message(MSG_AUDIO, audio=enc_b64(pcm))
 
 
-def robot_movement_message(axis: str, degrees: int = 0) -> str:
-    """Movement command: left/right/up/down with degrees, or center."""
-    if axis == "center":
-        return make_message(MSG_MOVEMENT, axis="center")
-    return make_message(MSG_MOVEMENT, axis=axis, degrees=int(degrees))
+def robot_movement_message(pan, tilt) -> str:
+    return make_message(MSG_MOVEMENT, pan=int(pan), tilt=int(tilt))
 
 
 def robot_emotion_message(name: str) -> str:

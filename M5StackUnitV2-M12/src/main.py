@@ -135,6 +135,7 @@ def main(argv=None) -> int:
         reconnect_delay=s["reconnect_delay"],
         record_restart_delay=s["record_restart_delay"],
         vad_config=s["vad"],
+        face_detect = s["face_detect"],
     )
     _tune_thread_stack()
     try:

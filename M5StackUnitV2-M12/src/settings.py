@@ -80,6 +80,12 @@ DEFAULTS = {
         '/media/sdcard/settings.json',
         'settings.json',
     ],
+
+    'face_detect': {
+        'resolution': (640, 480),
+        'max_radius': 60,
+        'lost_timeout': 1.5,
+    },
 }
 
 

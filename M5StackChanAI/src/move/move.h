@@ -15,13 +15,15 @@ class EspMovement
     struct Config
     {
         // Angle limits, degrees.
-        int minAngle = -180;
-        int maxAngle = 180;
+        int minXAngle = -170;
+        int maxXAngle = 170;
+        int minYAngle = 0;
+        int maxYAngle = 80;
     };
 
     bool begin();
     // Returns the head to the center position (pan=0, tilt=0).
-    void center();
+    void center(bool block = true);
 
     // Relative turns from the current position.
     void turnLeft(int degrees);   // pan += degrees
@@ -32,6 +34,7 @@ class EspMovement
     // Absolute positioning.
     void setPan(int degrees);
     void setTilt(int degrees);
+    void setPanAndTilt(int pan, int tilt);
 
     // Current position (internal state), degrees.
     int panDeg() const;
@@ -41,7 +44,7 @@ class EspMovement
     void stop();
 
     private:
-    void apply();  // sends the current angles to the drives
+    void apply(bool block = true);  // sends the current angles to the drives
 
     int panDeg_ = 0;
     int tiltDeg_ = 0;

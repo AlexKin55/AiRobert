@@ -37,12 +37,10 @@ class RobotSession(WsSession):
     # ------------------------------------------------------------------
     # Actions service -> robot.
     # ------------------------------------------------------------------
-    async def send_movement(self, axis: str, degrees: int = 0) -> bool:
+    async def send_movement(self, pan, tilte) -> bool:
         """Movement command {"type":"movement",...}."""
-        if axis not in proto.ROBOT_AXES:
-            logger.warning("[robot] movement: unknown axis %r", axis)
-            return False
-        text = proto.robot_movement_message(axis, degrees)
+
+        text = proto.robot_movement_message(pan, tilte)
         self.move_commands += 1
         logger.info("[robot] movement %s -> %s", text, self.peer)
         return await self.send_text(text)

@@ -104,12 +104,20 @@ class CameraSession(WsSession):
             return [(EV_IMAGE, jpeg)]
         if mtype == proto.MSG_FACE:
             face_id = str(msg.get("face_id", ""))
+            visible = bool(msg.get("visible", False))
+            pan_angle = msg.get("pan_angle")
+            tilt_angle = msg.get("tilt_angle")
             confidence = msg.get("confidence")
-            self.last_face = {"id": face_id, "confidence": confidence}
+
+            self.last_face = {"id": face_id, "visible": visible, "pan_angle": pan_angle,
+                "tilt_angle": tilt_angle, "confidence": confidence}
+
             self.face_events += 1
-            logger.info("[camera] face: id=%r confidence=%s",
-                        face_id, confidence)
-            return [(EV_FACE, face_id, confidence)]
+
+            logger.info("[camera] face: id=%r visible=%s pan=%s tilt=%s confidence=%s",
+                face_id, visible, pan_angle, tilt_angle, confidence,)
+
+            return [(EV_FACE, face_id, confidence, pan_angle, tilt_angle, visible,)]
         if mtype == proto.MSG_EMOTION:
             self.last_emotion = str(msg.get("emotion", ""))
             self.emotion_events += 1

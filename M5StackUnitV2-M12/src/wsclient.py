@@ -162,9 +162,10 @@ class WsClient:
         return self.send_message({'type': 'image',
                                   'image': base64.b64encode(jpeg).decode('ascii')})
 
-    def send_face(self, face_id, confidence=None):
+    def send_face(self, face_id, visible, pan_angle, tilt_angle, confidence=None):
         """Recognized face: {"type":"face","face_id":...,...}."""
-        payload = {'type': 'face', 'face_id': face_id}
+        payload = {'type': 'face', 'face_id': face_id, 'visible': visible,
+                   'pan_angle': pan_angle, 'tilt_angle': tilt_angle}
         if confidence is not None:
             payload['confidence'] = confidence
         return self.send_message(payload)

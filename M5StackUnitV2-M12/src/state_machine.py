@@ -24,7 +24,8 @@ class StateMachine:
     def __init__(self, url, sample_rate=16000, chunk_seconds=0.5,
                  audio_device=None, audio_channels=1, audio_sudo=None,
                  record_seconds=10, reconnect_delay=3.0,
-                 record_restart_delay=3.0, vad_config=None):
+                 record_restart_delay=3.0, vad_config=None, face_detect=None,
+                 resolution = (640, 480), max_radius = 60, lost_timeout = 1.5):
         self.url = url
         self.sample_rate = sample_rate
         self.chunk_seconds = chunk_seconds
@@ -35,6 +36,7 @@ class StateMachine:
         self.reconnect_delay = reconnect_delay
         self.record_restart_delay = record_restart_delay
         self.vad_config = vad_config
+        self.face_detect = face_detect
         self.client = None
         self.audio = None
         self.camera = None
@@ -78,7 +80,7 @@ class StateMachine:
             vad_config=self.vad_config,
         )
         self.audio.start()
-        self.camera = Camera(self.client)
+        self.camera = Camera(self.client, self.face_detect)
         return self
 
     def run(self, seconds=None):

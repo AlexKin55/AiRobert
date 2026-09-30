@@ -322,10 +322,10 @@ void RobotStateMachine::handleCommand(const std::string& text)
     if (type == "movement")
     {
         std::string axis;
-        long degrees = 0;
-        jsonFindString(text, "axis", axis);
-        jsonFindInt(text, "degrees", degrees);
-        handleMovement(axis, static_cast<int>(degrees));
+        long pan = 0, tilt = 0;
+        jsonFindInt(text, "pan", pan);
+        jsonFindInt(text, "tilt", tilt);
+        handleMovement(static_cast<int>(pan), static_cast<int>(tilt));
         return;
     }
     if (type == "emotion")
@@ -340,44 +340,16 @@ void RobotStateMachine::handleCommand(const std::string& text)
     LOG_D("[robot] unknown command type: %s\n", type.c_str());
 }
 
-void RobotStateMachine::handleMovement(const std::string& axis, int degrees)
+void RobotStateMachine::handleMovement(int pan, int tilt)
 {
-    LOG_I("[robot] movement: %s %d\n", axis.c_str(), degrees);
-    if (axis == "left")
-    {
-        movement_.turnLeft(degrees);
-    }
-    else if (axis == "right")
-    {
-        movement_.turnRight(degrees);
-    }
-    else if (axis == "up")
-    {
-        movement_.turnUp(degrees);
-    }
-    else if (axis == "down")
-    {
-        movement_.turnDown(degrees);
-    }
-    else if (axis == "center")
-    {
-        movement_.center();
-    }
-    else
-    {
-        LOG_W("[robot] movement: unknown axis %s\n", axis.c_str());
-        return;
-    }
+    LOG_I("[robot] movement: %d %d\n", pan, tilt);
+
+    movement_.setPan(pan);
+    movement_.setTilt(tilt);
 
     char cmd[64];
-    if (axis == "center")
-    {
-        snprintf(cmd, sizeof(cmd), "MOVE:center");
-    }
-    else
-    {
-        snprintf(cmd, sizeof(cmd), "MOVE:%s:%d", axis.c_str(), degrees);
-    }
+    snprintf(cmd, sizeof(cmd), "MOVE:%d:%d", pan, tilt);
+
     sendAck(cmd);
 }
 

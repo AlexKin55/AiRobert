@@ -61,7 +61,7 @@ class RobotStateMachine
     void onWsBinary(const uint8_t* data, size_t size);
 
     void handleCommand(const std::string& text);
-    void handleMovement(const std::string& axis, int degrees);
+    void handleMovement(int pan, int tilt);
     void handleEmotion(const std::string& name);
 
     // Queues an incoming PCM chunk for playback (dropped when full).
