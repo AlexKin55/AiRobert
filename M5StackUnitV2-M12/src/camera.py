@@ -21,8 +21,6 @@ import requests
 from .wsclient import WsClient
 
 
-WEBSOCKET_SERVER_URL = "ws://192.168.1.X:8765"
-
 # Разрешение, в котором Face Detector UnitV2
 # возвращает координаты лица.
 CAMERA_RESOLUTION = (640, 480)
@@ -154,7 +152,18 @@ def reset_smoothing():
     _smooth["tilt"] = None
 
 
-def track_single_face(data, client, max_radius, lost_timeout):
+def send_movement_to_robot(robot, pan, tilt):
+    """Шлёт роботу команду движения по локальному соединению камеры."""
+    if robot is None or not robot.connected:
+        return False
+    return robot.send_text(json.dumps({
+        'type': 'movement',
+        'pan': int(round(pan)),
+        'tilt': int(round(tilt)),
+    }))
+
+
+def track_single_face(data, client, max_radius, lost_timeout, robot=None):
     """
     Выбирает и отслеживает одно лицо.
 
@@ -162,6 +171,9 @@ def track_single_face(data, client, max_radius, lost_timeout):
     выбирается самое большое лицо с confidence >= 0.80.
 
     После выбора отслеживается именно оно.
+
+    Углы поворота шлются роботу напрямую (локально), в облако уходит
+    только событие для статистики.
     """
 
     global next_id
@@ -259,6 +271,9 @@ def track_single_face(data, client, max_radius, lost_timeout):
 
             pan, tilt = smooth_angles(*angles)
 
+            # Движение робота инициируется здесь (локально, без облака).
+            send_movement_to_robot(robot, pan, tilt)
+
             client.send_face(
                 active_target["id"],
                 True,
@@ -353,6 +368,9 @@ def track_single_face(data, client, max_radius, lost_timeout):
             reset_smoothing()
             pan, tilt = smooth_angles(*angles)
 
+            # Движение робота инициируется здесь (локально, без облака).
+            send_movement_to_robot(robot, pan, tilt)
+
             client.send_face(
                 active_target["id"],
                 True,
@@ -364,9 +382,10 @@ def track_single_face(data, client, max_radius, lost_timeout):
 
 class Camera:
 
-    def __init__(self, client, face_detect_cfg):
+    def __init__(self, client, face_detect_cfg, robot=None):
 
         self.client = client
+        self.robot = robot   # RobotServer (локальный WS-сервер для робота)
         self.frames_sent = 0
         self.last_error = None
         self.resolution = face_detect_cfg["resolution"]
@@ -519,6 +538,7 @@ class Camera:
                             self.client,
                             self.max_radius,
                             self.lost_timeout,
+                            self.robot,
                         )
 
                     except json.JSONDecodeError as exc:

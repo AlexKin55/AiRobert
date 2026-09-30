@@ -86,6 +86,50 @@ DEFAULTS = {
         'max_radius': 60,
         'lost_timeout': 1.5,
     },
+
+    # Local WebSocket SERVER for the robot (M5StackChanAI connects here).
+    # The camera controls the robot locally: ws://<camera-ip>:port/path.
+    'robot': {
+        'enabled': True,
+        'host': '0.0.0.0',
+        'port': 8765,
+        'path': '/robot',
+    },
+
+    # Local touch reaction: the camera itself shows the emotion and plays the
+    # sound on the robot (no cloud round-trip; works offline).
+    'touch': {
+        'enabled': True,
+        'emotion': 'happy',
+        'sound_file': 'sounds/touch.wav',   # WAV PCM int16 LE 16 kHz mono
+    },
+
+    # How the camera plays audio on the robot (it splits the full audio
+    # answer from the cloud into chunks itself):
+    #   chunk_seconds — one binary PCM frame duration (0.15 s = 4800 B,
+    #                   stays below the robot WS receive limit ~8 KB);
+    #   speed        — delivery pace: pause between frames = duration / speed
+    #                  (1.0 = real time);
+    #   drop_tail_seconds — mic remains muted this long after EOF (echo tail).
+    'playback': {
+        'chunk_seconds': 0.15,
+        'speed': 1.0,
+        'drop_tail_seconds': 2.0,
+    },
+
+    # Post-dialogue emotion decay timers ON THE CAMERA (Neutral -> Sad ->
+    # Sleepy + yawn + snore). Phrases for each stage are requested from
+    # AiService; if the cloud is offline the emotion still switches locally.
+    'decay': {
+        'enabled': True,
+        'neutral_min': 5.0,      # minutes after the dialogue end
+        'sad_min': 30.0,
+        'sleepy_min': 60.0,
+        'snore_after_min': 60.1,  # minutes after the Sleepy phrase
+        'timeout_s': 25.0,       # wait for the cloud phrase answer
+        'yawn_file': 'sounds/yawn.wav',
+        'snore_file': 'sounds/snore.wav',
+    },
 }
 
 

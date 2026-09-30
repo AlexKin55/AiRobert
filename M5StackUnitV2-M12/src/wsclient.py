@@ -54,6 +54,9 @@ class WsClient:
         self.ws = None
         self.connected = False
         self.attempts = 0       # number of reconnect attempts
+        # Whether the robot is connected to the camera's local WS server
+        # (updated by the state machine; reported to AiService in hb).
+        self.robot_connected = False
         self._thread = None
         self._stop = threading.Event()
 
@@ -175,8 +178,31 @@ class WsClient:
         return self.send_message({'type': 'emotion', 'emotion': emotion})
 
     def send_hb(self):
-        """Heartbeat: {"type":"hb"}."""
-        return self.send_message({'type': 'hb'})
+        """Heartbeat: {"type":"hb","robot":<bool>}.
+
+        The robot flag tells AiService whether the robot is connected to the
+        camera's local WS server (used for /health and decay scheduling).
+        """
+        return self.send_message({'type': 'hb', 'robot': self.robot_connected})
+
+    def send_touch(self, action):
+        """Robot touch relayed to AiService: {"type":"touch","action":...}.
+
+        The camera reacts to the touch locally (emotion + sound); the event is
+        forwarded only for statistics/logs. False if the cloud is offline —
+        the camera keeps working without it.
+        """
+        return self.send_message({'type': 'touch', 'action': action})
+
+    def send_decay_request(self, emotion):
+        """Asks AiService to synthesize a decay phrase: {"type":"decay",...}.
+
+        Used by the emotion-decay scheduler on the camera: the cloud answers
+        with playback PCM frames (delivered via on_binary). If the cloud is
+        offline (False) or never answers, the camera still switches the robot
+        emotion locally — audio is just skipped.
+        """
+        return self.send_message({'type': 'decay', 'emotion': emotion})
 
     # --- receiving --------------------------------------------------------
     def _recv_loop(self):

@@ -135,7 +135,11 @@ def main(argv=None) -> int:
         reconnect_delay=s["reconnect_delay"],
         record_restart_delay=s["record_restart_delay"],
         vad_config=s["vad"],
-        face_detect = s["face_detect"],
+        face_detect=s["face_detect"],
+        robot_cfg=s["robot"],
+        touch_cfg=s["touch"],
+        playback_cfg=s["playback"],
+        decay_cfg=s["decay"],
     )
     _tune_thread_stack()
     try:

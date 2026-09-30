@@ -2,15 +2,18 @@
 
 The camera connects as a WebSocket client to ws://host:port/camera and sends
 TEXT JSON messages (see protocol.py):
-    hello, audio (base64 PCM), image (base64 JPEG), face, emotion, hb
+    hello, audio (base64 PCM), image (base64 JPEG), face, emotion,
+    touch (robot touch relay), decay (decay phrase request), hb
 
-The session parses/decode messages, keeps statistics and returns a list of
+The session parses/decodes messages, keeps statistics and returns a list of
 media events for the state machine:
     [("audio", pcm_bytes)], [("image", jpeg_bytes)],
-    [("face", face_id, confidence)], [("emotion", name)]
+    [("face", face_id, confidence, pan, tilt, visible)], [("emotion", name)],
+    [("touch", action)], [("decay", emotion)]
 
 The service may reply with mute/unmute/capture (send_mute/send_unmute/
-send_capture).
+send_capture), emotion-for-the-robot (send_emotion) and full audio answers
+(send_play) which the camera plays on the robot locally.
 """
 from __future__ import annotations
 
@@ -32,6 +35,8 @@ EV_AUDIO = "audio"
 EV_IMAGE = "image"
 EV_FACE = "face"
 EV_EMOTION = "emotion"
+EV_TOUCH = "touch"
+EV_DECAY = "decay"
 
 DEFAULT_FORMAT: Dict[str, Any] = {
     "audio": {
@@ -56,6 +61,10 @@ class CameraSession(WsSession):
         self.device = ""
         self.last_face: Optional[Dict[str, Any]] = None
         self.last_emotion: str = ""
+        # Whether the robot is connected to the CAMERA's local WS server
+        # (reported by the camera in every hb; the cloud controls the robot
+        # only through the camera).
+        self.robot_connected = False
         # Monotonic time of the last message received from the camera
         # (any type: audio/HB/image); the watchdog detects a hung camera.
         self.last_activity = 0.0
@@ -65,6 +74,13 @@ class CameraSession(WsSession):
         self.audio_bytes = 0
         self.face_events = 0
         self.emotion_events = 0
+        self.touch_events = 0     # robot touches relayed via the camera
+        self.last_touch = ""
+        self.decay_requests = 0   # decay phrase requests from the camera
+        # Playback sent to the camera (which relays it to the robot):
+        self.playback_bytes = 0
+        self.playback_messages = 0
+        self.emotion_commands = 0
 
     # ------------------------------------------------------------------
     # Incoming JSON message -> media events.
@@ -84,7 +100,11 @@ class CameraSession(WsSession):
             self._on_hello(msg)
             return []
         if mtype == proto.MSG_HB:
-            logger.info("[camera] HB from %s", self.peer)
+            # The hb carries the robot status (connected to the camera's
+            # local WS) — used for /health and decay scheduling.
+            self.robot_connected = bool(msg.get("robot", self.robot_connected))
+            logger.info("[camera] HB from %s (robot=%s)", self.peer,
+                        self.robot_connected)
             return []
         if mtype == proto.MSG_AUDIO:
             try:
@@ -123,6 +143,21 @@ class CameraSession(WsSession):
             self.emotion_events += 1
             logger.info("[camera] face emotion: %r", self.last_emotion)
             return [(EV_EMOTION, self.last_emotion)]
+        if mtype == proto.MSG_TOUCH:
+            # Robot touch relayed via the camera (the camera reacts locally;
+            # this event is for statistics/logs only).
+            action = str(msg.get("action", ""))
+            self.touch_events += 1
+            self.last_touch = action
+            logger.info("[camera] robot touch: %r (total %d)", action,
+                        self.touch_events)
+            return [(EV_TOUCH, action)]
+        if mtype == proto.MSG_DECAY:
+            # The camera asks to synthesize a decay phrase.
+            emotion = str(msg.get("emotion", ""))
+            self.decay_requests += 1
+            logger.info("[camera] decay phrase request: %r", emotion)
+            return [(EV_DECAY, emotion)]
         logger.info("[camera] unknown message type: %s", mtype)
         return []
 
@@ -139,22 +174,29 @@ class CameraSession(WsSession):
     # ------------------------------------------------------------------
     # Commands service -> camera.
     # ------------------------------------------------------------------
-    async def send_mute(self) -> bool:
-        """Asks the camera to turn its microphone off (robot is playing)."""
-        ok = await self.send_text(proto.mute_message())
-        logger.info("[camera] mute -> %s", "ok" if ok else "no connection")
+    async def send_play(self, pcm: bytes, decay: str = "") -> bool:
+        """Sends a FULL audio answer to the camera: {"type":"play",...}.
+
+        The camera splits the PCM into chunks and plays it on the robot with
+        real-time pacing (the cloud sends one message per answer, no chunk
+        relay). ``decay`` marks a decay phrase for the emotion-decay scheduler.
+        """
+        ok = await self.send_text(proto.play_message(pcm, decay=decay))
+        if ok:
+            self.playback_messages += 1
+            self.playback_bytes += len(pcm)
+        logger.info("[camera] play -> %s (%d B%s)", "ok" if ok else "no",
+                    len(pcm), ", decay=%s" % decay if decay else "")
         return ok
 
-    async def send_unmute(self) -> bool:
-        """Asks the camera to turn its microphone back on."""
-        ok = await self.send_text(proto.unmute_message())
-        logger.info("[camera] unmute -> %s", "ok" if ok else "no connection")
-        return ok
-
-    async def send_capture(self) -> bool:
-        """Asks the camera to take a picture and send it as an image message."""
-        ok = await self.send_text(proto.capture_message())
-        logger.info("[camera] capture -> %s", "ok" if ok else "no connection")
+    async def send_emotion(self, name: str) -> bool:
+        """Emotion command for the robot via the camera
+        ({"type":"emotion","name":...} — the camera relays it locally)."""
+        ok = await self.send_text(proto.robot_emotion_message(name))
+        if ok:
+            self.emotion_commands += 1
+        logger.info("[camera] emotion %r -> %s", name,
+                    "ok" if ok else "no connection")
         return ok
 
     # ------------------------------------------------------------------

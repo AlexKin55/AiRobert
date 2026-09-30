@@ -70,8 +70,11 @@ class Audio:
 
     def __init__(self, client, sample_rate=16000, chunk_seconds=0.5,
                  channels=1, device=None, sudo=None, restart_delay=3.0,
-                 muted=False, vad_config=None):
+                 muted=False, vad_config=None, on_speech_started=None):
         self.client = client
+        # Called when the VAD detects the start of a speech segment (the
+        # camera restarts the emotion decay countdown on user speech).
+        self.on_speech_started = on_speech_started
         self.sample_rate = int(sample_rate)
         self.channels = max(1, min(2, int(channels)))
         self.device = device or 'default'   # ALSA device (plughw:1,0 etc.)
@@ -227,6 +230,11 @@ class Audio:
                     continue  # silence — do not send
                 if not was_active and self.vad.active:
                     log.info('VAD: segment %d started', self.vad.segments)
+                    if self.on_speech_started is not None:
+                        try:
+                            self.on_speech_started()
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning('on_speech_started error: %s', exc)
             self.push(data)
         # Collect stderr (device open errors etc.).
         err = b''

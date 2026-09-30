@@ -1,38 +1,20 @@
-"""AiService JSON protocol (camera <-> service, service <-> robot).
+"""AiService JSON protocol (camera <-> service, TEXT JSON, base64 embedded).
 
-All messages are TEXT JSON. Binary data (PCM audio, JPEG pictures) is
-embedded as base64 strings in dedicated fields.
+The robot is controlled BY THE CAMERA over a local WS (M5StackUnitV2-M12);
+AiService may run in the cloud and only talks to the camera.
 
-EVERY message carries a "timestamp" field: Unix time in MICROSECONDS
-(int(time.time() * 1_000_000)). It is added automatically by make_message()
-on the service side; clients must add it to their outgoing messages too.
+Every message carries "timestamp": Unix time in MICROSECONDS (added by
+make_message; clients add it too).
 
-Camera -> service (/camera):
-    {"type":"hello","device":"unitv2","timestamp":1727000000000000,
-     "format":{"audio":{"rate":16000,"channels":1,"bits":16},
-               "image":{"codec":"jpeg"}}}
-    {"type":"audio","audio":"<base64 pcm int16 LE 16kHz mono>","timestamp":...}
-    {"type":"image","image":"<base64 jpeg>","timestamp":...}
-    {"type":"face","face_id":"alex","confidence":0.97,"timestamp":...}
-    {"type":"emotion","emotion":"happy","timestamp":...}  # face emotion
-    {"type":"hb","timestamp":...}
+Camera -> service:
+    hello / audio (b64 PCM) / image (b64 JPEG) / face / emotion (face)
+    touch (robot touch relay) / decay (phrase request) / hb (with robot flag)
 
 Service -> camera:
-    {"type":"ok","detail":"ok","timestamp":...}
-    {"type":"mute"} / {"type":"unmute"} / {"type":"capture"} (+timestamp)
-
-Service -> robot (/robot):
-  Text (commands):
-    {"type":"movement","axis":"left","degrees":60,"timestamp":...}
-    {"type":"emotion","name":"happy","timestamp":...}
-  Binary (playback audio): [byte0=type][byte1=codec][raw PCM int16 LE
-  16 kHz mono]; an empty payload [type][codec] = end-of-stream marker.
-  Audio is binary so the ESP32 plays the PCM directly from the frame
-  buffer without base64/JSON decoding (no stutter) — commands stay text.
-
-Robot -> service (text):
-    {"type":"hb","timestamp":...}
-    {"type":"ack","command":"MOVE:left:60","timestamp":...}
+    ok / error
+    {"type":"emotion","name":...}                  # emotion for the robot
+    {"type":"play","audio":"<b64 full PCM>"}       # one full audio answer
+    {"type":"play","audio":"...","decay":"<em>"}   # decay phrase (stale dropped)
 """
 from __future__ import annotations
 
@@ -52,29 +34,17 @@ MSG_EMOTION = "emotion"
 MSG_HB = "hb"
 MSG_OK = "ok"
 MSG_ERROR = "error"
-MSG_MUTE = "mute"
-MSG_UNMUTE = "unmute"
-MSG_CAPTURE = "capture"
-MSG_MOVEMENT = "movement"
-MSG_ACK = "ack"
 MSG_TOUCH = "touch"
+MSG_PLAY = "play"
+MSG_DECAY = "decay"
 
 # Robot emotion names (validated before sending).
 ROBOT_EMOTIONS = (
     "happy", "angry", "sad", "doubt", "sleepy", "neutral",
 )
 
-# Robot movement axes (validated before sending).
-ROBOT_AXES = ("left", "right", "up", "down", "center")
-
 # Head-touch actions sent by the robot ({"type":"touch","action":...}).
 TOUCH_ACTIONS = ("press", "release", "swipe_forward", "swipe_backward")
-
-# Binary audio frame layout (server -> robot): byte[0] = type,
-# byte[1] = codec, then raw PCM payload. The only codec is 1:
-# raw PCM int16 LE, 16 kHz mono. An empty payload = EOF marker.
-ROBOT_AUDIO_FRAME_TYPE = 1
-ROBOT_AUDIO_CODEC_PCM = 1
 
 
 # ---------------------------------------------------------------------------
@@ -162,39 +132,21 @@ def error_message(detail: str) -> str:
     return make_message(MSG_ERROR, detail=detail)
 
 
-def mute_message() -> str:
-    return make_message(MSG_MUTE)
+def play_message(pcm: bytes, decay: str = "") -> str:
+    """Full audio answer for the camera: {"type":"play","audio":"<b64>"}.
 
-
-def unmute_message() -> str:
-    return make_message(MSG_UNMUTE)
-
-
-def capture_message() -> str:
-    return make_message(MSG_CAPTURE)
-
-
-# ---------------------------------------------------------------------------
-# Service -> robot messages.
-# ---------------------------------------------------------------------------
-def robot_audio_message(pcm: bytes) -> str:
-    """Playback chunk for the robot; empty pcm = end-of-stream marker."""
-    return make_message(MSG_AUDIO, audio=enc_b64(pcm))
-
-
-def robot_movement_message(pan, tilt) -> str:
-    return make_message(MSG_MOVEMENT, pan=int(pan), tilt=int(tilt))
+    The cloud sends ONE message per answer — the CAMERA splits the PCM into
+    chunks and plays them on the robot with real-time pacing (no chunk relay
+    through the cloud). An optional ``decay=<emotion>`` marks a decay phrase;
+    the camera drops stale answers.
+    """
+    fields: Dict[str, Any] = {"audio": enc_b64(pcm)}
+    if decay:
+        fields["decay"] = decay
+    return make_message(MSG_PLAY, **fields)
 
 
 def robot_emotion_message(name: str) -> str:
+    """Emotion command for the robot via the camera:
+    {"type":"emotion","name":...} (the camera relays it locally)."""
     return make_message(MSG_EMOTION, name=name)
-
-
-def robot_ack_message(command: str) -> str:
-    """Robot -> service: movement finished (ACK:MOVE...)."""
-    return make_message(MSG_ACK, command=command)
-
-
-def robot_audio_frame(pcm: bytes) -> bytes:
-    """Binary playback frame [type][codec][pcm]; empty pcm = EOF marker."""
-    return bytes((ROBOT_AUDIO_FRAME_TYPE, ROBOT_AUDIO_CODEC_PCM)) + pcm

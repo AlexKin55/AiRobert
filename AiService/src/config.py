@@ -17,7 +17,6 @@ from typing import Any, Dict
 _DEFAULTS: Dict[str, Any] = {
     "server": {"host": "0.0.0.0", "port": 9002},
     "camera_ws": {"path": "/camera"},
-    "robot_ws": {"path": "/robot"},
     "audio": {
         "sample_rate": 16000,
         "channels": 1,
@@ -40,15 +39,6 @@ _DEFAULTS: Dict[str, Any] = {
         "save_prompts": True,
         "audio_rotate_seconds": 0,
     },
-    "robot": {
-        "play_chunk_seconds": 0.15,
-        "play_speed": 1.0,
-        "drop_audio_during_playback": True,
-    },
-    "touch": {
-        "enabled": True,
-        "sound_file": "sounds/touch.wav",
-    },
     "yandex": {
         "api_key": "",
         "folder_id": "",
@@ -65,12 +55,6 @@ _DEFAULTS: Dict[str, Any] = {
     },
     "emotion_decay": {
         "prompt": "",
-        "neutral_min": 0.17,
-        "sad_min": 0.5,
-        "sleepy_min": 0.75,
-        "snore_after_min": 0.08,
-        "yawn_file": "sounds/yawn.wav",
-        "snore_file": "sounds/snore.wav",
     },
 }
 

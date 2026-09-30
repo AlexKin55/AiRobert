@@ -36,15 +36,18 @@
 #define WIFI_RECONNECT_DELAY_MS 5000u
 #endif
 
-// WebSocket server the robot connects to: the AiService /robot endpoint
-// (JSON protocol, see AiService/src/protocol.py). WS_PORT must match the
-// AiService server.port (9002) and WS_PATH — the robot_ws.path ("/robot").
+// WebSocket server the robot connects to: the CAMERA's local WS server
+// (M5StackUnitV2-M12, src/robot_server.py) — ws://<camera-ip>:8765/robot.
+// The camera controls the robot locally (face-tracking movement, playback,
+// emotions, touch reaction); AiService may run in the cloud and never talks
+// to the robot directly. WS_HOST must be the camera's LAN IP; WS_PORT and
+// WS_PATH correspond to the camera settings robot.port / robot.path.
 #ifndef WS_HOST
-#define WS_HOST "192.168.1.8"
+#define WS_HOST "192.168.1.100"
 #endif
 
 #ifndef WS_PORT
-#define WS_PORT 9002u
+#define WS_PORT 8765u
 #endif
 
 #ifndef WS_PATH

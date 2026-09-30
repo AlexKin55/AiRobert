@@ -301,18 +301,14 @@ class Processor:
 
     async def on_face(self, face_id: str,
                       confidence, pan, tilte) -> None:
-        """Recognized-face event from the camera. Stub: log only."""
+        """Recognized-face event from the camera. Stub: log only.
+
+        The camera itself steers the robot (movement), so this is just a log
+        for future AI use.
+        """
         logger.info("[ai] face: id=%r confidence=%s (stub), pan=%s, tilte=%s",
                     face_id, confidence, pan, tilte)
-        if confidence < 0.80:
-            return None
-
-        return pan, tilte
 
     async def on_camera_emotion(self, emotion: str) -> None:
         """Face emotion recognized by the camera. Stub: log only."""
         logger.info("[ai] face emotion: %r (stub)", emotion)
-
-    async def on_robot_text(self, text: str) -> None:
-        """Text from the robot. Stub: log only."""
-        logger.info("[ai] robot text: %r (stub)", text)

@@ -1,10 +1,14 @@
-"""AiService — FastAPI entry point with two WebSocket endpoints.
+"""AiService — FastAPI entry point with ONE WebSocket endpoint.
 
   /camera (config camera_ws.path) — the camera connects as a WS client and
       sends JSON: audio (base64 PCM), pictures (base64 JPEG), face/emotion
-      events; the service may reply mute/unmute/capture;
-  /robot  (config robot_ws.path)  — the robot (AiBot firmware) connects as a
-      WS client and receives JSON playback chunks, movements and emotions.
+      events, robot-touch relay, decay phrase requests; the service replies
+      mute/unmute/capture, emotion commands for the robot and FULL audio
+      answers ({"type":"play","audio":"<b64>"}).
+
+The ROBOT is controlled by the CAMERA over a local WS
+(ws://<camera-ip>:8765/robot) — AiService may run in the cloud and never
+talks to the robot directly (see M5StackUnitV2-M12/src/robot_server.py).
 
 All messages are TEXT JSON (protocol.py); binary data is base64-embedded.
 
@@ -26,7 +30,6 @@ from . import config as app_config
 from . import recorder as recorder_mod
 from .camera import CameraSession
 from .processor import Processor
-from .robot import RobotSession
 from .state_machine import AiStateMachine
 
 logger = logging.getLogger("uvicorn")
@@ -43,11 +46,10 @@ rec = recorder_mod.Recorder(
     rotate_seconds=_REC_CFG.get("audio_rotate_seconds", 0),
 )
 
-# Global sessions and the state machine.
+# Global session and the state machine (the robot is controlled via camera).
 camera = CameraSession()
-robot = RobotSession()
 ai = Processor(rec=rec)
-sm = AiStateMachine(camera, robot, ai, rec=rec)
+sm = AiStateMachine(camera, ai, rec=rec)
 
 
 @asynccontextmanager
@@ -101,33 +103,6 @@ async def camera_endpoint(ws: WebSocket):
 
 
 # ---------------------------------------------------------------------------
-# WebSocket: robot (/robot)
-# ---------------------------------------------------------------------------
-@app.websocket(app_config.CONFIG["robot_ws"]["path"])
-async def robot_endpoint(ws: WebSocket):
-    """Accepts the robot connection (JSON protocol)."""
-    await ws.accept()
-    await robot.attach(ws)
-    await sm.on_robot_connected()
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
-            data = msg.get("bytes")
-            if data is not None:
-                logger.info("[robot] binary message (%d B) — "
-                            "text protocol only, ignored", len(data))
-                continue
-            text = msg.get("text")
-            if text is not None:
-                await sm.on_robot_message(text)
-    finally:
-        await sm.on_robot_disconnected()
-        await robot.detach()
-
-
-# ---------------------------------------------------------------------------
 # HTTP: diagnostics.
 # ---------------------------------------------------------------------------
 @app.get("/health")
@@ -139,8 +114,8 @@ async def health():
 def main() -> None:
     """Server entry point: python3 -m src.server.
 
-    Always listens on 0.0.0.0 so the camera and the robot can connect via
-    the machine's LAN address. Override: AISERVICE_HOST / AISERVICE_PORT.
+    Always listens on 0.0.0.0 so the camera can connect via the machine's
+    LAN address. Override: AISERVICE_HOST / AISERVICE_PORT.
     """
     import uvicorn
 
@@ -152,10 +127,8 @@ def main() -> None:
         str(Path(__file__).resolve().parent.parent / "config" /
             "logging.json"))
     cam_path = app_config.CONFIG["camera_ws"]["path"]
-    rob_path = app_config.CONFIG["robot_ws"]["path"]
-    logger.info("Server listening on ws://%s:%d%s (camera) and "
-                "ws://%s:%d%s (robot)", host, port, cam_path,
-                host, port, rob_path)
+    logger.info("Server listening on ws://%s:%d%s (camera)",
+                host, port, cam_path)
     uvicorn.run("src.server:app", host=host, port=port,
                 log_config=log_cfg)
 

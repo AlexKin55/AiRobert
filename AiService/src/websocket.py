@@ -1,7 +1,8 @@
 """Base WebSocket session wrapper (common send helpers).
 
-Subclasses: CameraSession (/camera) and RobotSession (/robot). Both live in
-the same FastAPI process; the state machine routes frames between them.
+Subclass: CameraSession (/camera). The robot is now controlled by the CAMERA
+over a local WS (see M5StackUnitV2-M12/src/robot_server.py) — AiService may
+run in the cloud and has only one WebSocket endpoint.
 """
 from __future__ import annotations
 
